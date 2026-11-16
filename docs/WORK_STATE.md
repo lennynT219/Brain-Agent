@@ -2,38 +2,33 @@
 
 ## Objective and scope
 
-- H1: library-only bound-project memory archive, including create-from-view, revision/current reads, immutable logical successors and stale-update rejection. Implemented with isolated synthetic fixtures; awaiting parent-arranged read-only review.
-- Authorized surfaces: `src/lib.rs`, new `src/memory/{mod,store}.rs`, `tests/memory_store.rs`, `docs/PROJECT_MEMORY_STORE.md`, this record. Brain writer owns these; StelaShell parent owns its own documents/integration.
-- Preserve the pre-existing document/CLI/config/vault/Cargo/lock/features/tests implementation; no dependency changes/downloads, real-data activation, profiles/services, branch/switch, push/publication or external/model operations are authorized. The user authorized one local commit of the existing Brain base plus H1; the personal `Brain/` vault and `.codegraph/` are excluded.
+- Mantener Brain como proyecto independiente, conservando la base existente: preparación del vault, selección/configuración y metadatos de Note/Project/Task.
+- El usuario solicitó retirar únicamente el archivo experimental de memorias y las propuestas de integración asociadas, sin volver al esqueleto inicial ni perder la base anterior.
+- Preservar el vault personal `Brain/` y los cambios previos de la base. No instalar dependencias, cambiar perfiles/servicios ni publicar. El alcance Git autorizado es un commit de la retirada, integración local en `main` y eliminación de las otras ramas locales ya integradas.
 
 ## Current decisions
 
-- Brain is the general second brain; project memory is one capability. One stable StelaShell collection per project is shared across authorized bound sessions; sessions are provenance, not ownership/lifetime.
-- Automatic management applies only to that project's agent-owned memories. Personal notes/other projects require explicit direction; recalled text is data, not permissions/instructions. No automatic transcript capture/deletion.
-- Selected update strategy: new write-once revisions, separate human-editable view, no automatic same-note replacement or manual import/merge.
-- The user directly confirmed deleting the untracked `odd/` records and instructed leaving them absent; do not restore/reconstruct them. This resolves the unexplained-deletion blocker, not the pending H1 review.
-- The user confirmed one local commit containing the Brain base plus H1: code, repository configuration, Cargo/lock, tests and documentation. Exclude `Brain/` and `.codegraph/`; leave untracked `odd/` deleted. No push or further commits are authorized by that decision. Git history supplies the commit identity.
-- H1 takes a trusted supplied typed Project and caller-supplied UUIDs/pre-existing view. Structural validation does not prove consent, repository mapping or actual vault-project existence. No discovery/generator/YAML reader/connector.
-- Revision store assumes cooperating writers and trusted stable ancestors; exact-byte snapshots plus numeric identity are not tamper-proof history or filesystem CAS. Original view base is revision 1, not the newest inference.
+- El modelo implementado sigue siendo Note/Project/Task, con identidad UUID, título y versión; Task tiene relación con Project y estados propios.
+- `init` prepara la estructura PARA/sistema pero no selecciona el vault; la selección es una operación explícita y validada.
+- Los metadatos tipados no son un códec completo de Markdown ni autorizan reescribir propiedades desconocidas, comentarios o cuerpo de notas existentes.
+- `odd/` fue eliminado intencionalmente por el usuario; dejarlo ausente, sin reconstruirlo.
+- El usuario confirmó excluir el vault personal y su configuración mediante `/Brain/` en `.gitignore`, sin borrar su contenido ni versionarlo.
+- El usuario autorizó un commit de los cambios actuales, dejar el proyecto en `main` e integrar/eliminar las otras ramas locales preservando su trabajo. No hay autorización para push, borrar ramas remotas, forzar borrados de trabajo no integrado o reescribir el historial.
 
 ## Outcome status
 
-- H1 implemented and scoped checks passing; source is review-ready, independent review still pending. The missing `odd/` records are confirmed intentional by the user and remain absent. Six allowed H1 source/test/document paths only; no full memory-product completion claimed.
-- Typed managed metadata (older file-model block 1) remains intact. File-model block 2/YAML reader remains separately blocked pending its own dependency/workload authorization; H1 does not resume it.
-- Existing init/config behavior preserved by unchanged source plus isolated CLI regressions.
+- Retirados el módulo experimental de memorias, su exportación pública, sus pruebas y su documento de formato. Esta continuidad reemplaza las propuestas anteriores y describe únicamente la base vigente.
+- Conservados CLI de inicialización/configuración, validación del vault, modelos documentales y pruebas previas.
+- Base verificada en modo offline: 41 pruebas pasaron, sin fallos. La comprobación de referencias y la comparación de los 15 archivos de código/configuración/pruebas/documentación previos confirman la retirada y preservación de la base.
 
 ## Relevant evidence
 
-- Branch `feat/brain-file-model`; H1 start baseline was `5ccb129fdc817ccc0c64ad4b593431167a1d3cbf`. Before the requested commit, all 41 remaining protected pre-existing files were byte-identical; H1 changed only the existing library export and its five new files. Five baseline `odd/tasks/brain-{init-tests,vault-bootstrap,human-names,vault-config,file-model}.md` files were intentionally deleted by the user; they were untracked and cannot produce a Git deletion. No restoration is intended.
-- Linux x86_64, rustc/cargo 1.100.0. Existing locked dependencies available offline; Cargo/lock/features unchanged.
-- `cargo test --locked --offline --test memory_store`: 10 passed; 1 ignored IPC child entry is explicitly executed and checked by the deterministic subprocess test.
-- `cargo test --locked --offline --lib`: 12 passed (7 existing metadata, 5 private publication/lock tests). `--test cli_init --test cli_config`: 10 + 5 passed. Scoped rustfmt check passed; no warnings in final checks.
-- Earlier parallel tests caught lock lifetime extension through fork-inherited descriptors; explicit RAII unlock corrected it, with a deterministic cloned-descriptor regression test and passing parallel/process checks.
-- Format, API, finite bounds, publication/uncertain-I/O semantics, failure injection and platform limits are detailed in `docs/PROJECT_MEMORY_STORE.md`. Fault injection is not power-loss verification; no Windows/network-FS/full-suite/clippy/crash-durability claim.
+- Punto de partida de la limpieza Git: `feat/brain-file-model` en `9b4a95933002028ce8c16f02c278038545810ae7`; `main` y `feat/brain-vault-config` estaban en su antecesor `5ccb129`. Ninguna de esas ramas tenía trabajo exclusivo respecto a la rama actual, por lo que la integración admite fast-forward y borrado local seguro. La identidad final del commit se consulta en Git.
+- La exportación pública vuelve a ser únicamente `pub mod document;`. Cargo/lock/dependencias y el código previo de la base no requieren cambios para esta retirada.
+- `cargo test --locked --offline`: 7 pruebas de metadatos, 19 de configuración/vault y 15 de CLI pasaron; 0 fallos, 0 pruebas documentales. Sin descargas ni cambios de dependencias.
+- `rustfmt --check --edition 2024 src/lib.rs` y `git diff --check` pasaron. Antes del ajuste de `.gitignore`, los 15 archivos de la base coincidían byte por byte con sus hashes previos al experimento; no hubo cambios posteriores en fuentes o pruebas. La búsqueda en código y documentación activos no encontró referencias a la integración retirada. El contenido personal/autogenerado no se restaura a un checkpoint antiguo.
 
 ## Next actions and open questions
 
-- Keep the personal `Brain/` vault and `.codegraph/` outside the authorized code/base/H1 commit. Do not interpret the local commit request as push/publication or broader feature permission.
-- Parent to arrange read-only H1 review; transport acceptance is not completion/approval. No further feature expansion or real-vault activation authorized. Leave the user-deleted `odd/` absent.
-- General request-key/exactly-once guarantees, ID generation, real-vault project verification, managed-Note extensions, lexical search, manual import/reconciliation and StelaShell connector remain outside H1.
-- All revision writers must honor write-once storage. Arbitrary-editor edits never observed cannot be retained. Missing/unsafe/unreadable views currently block even historical reads; ordinary manual divergence/competing-head history reads are supported with explicit status.
+- Mantener `main` como rama de trabajo tras esta limpieza. No se requiere más código para la retirada; nuevas funcionalidades, commits posteriores y publicación requieren su autorización correspondiente.
+- No restaurar `odd/`, modificar contenido personal ni implementar un nuevo backend o integración sin un alcance solicitado por el usuario.

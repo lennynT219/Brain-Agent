@@ -1,3 +1,5 @@
 /target
 # Local Pi runtime state
 .atl/
+# Vault personal y configuración local de Obsidian
+/Brain/
