@@ -6,6 +6,17 @@ use anyhow::{Result, bail};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use std::{borrow::Cow, ops::Range};
 
+/// Fixed diagnostic category; never carries document content or paths.
+#[derive(Debug)]
+pub(crate) struct UnclosedHtml;
+
+impl std::fmt::Display for UnclosedHtml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unclosed literal HTML element/comment")
+    }
+}
+impl std::error::Error for UnclosedHtml {}
+
 pub(crate) fn active_relations(body: &str) -> Result<Vec<String>> {
     // pulldown's fenced-info handling does not consistently split bare CR.
     // An equal-length view makes CR a logical newline while retaining an exact
@@ -116,7 +127,7 @@ pub(crate) fn active_relations(body: &str) -> Result<Vec<String>> {
         }
     }
     if html.is_some() {
-        bail!("unclosed literal HTML element/comment");
+        return Err(UnclosedHtml.into());
     }
     if headings != CURRENT_SECTIONS.len() {
         bail!("Memory requires exactly five ordered canonical top-level H2s");
@@ -162,7 +173,7 @@ fn next_comment(source: &str) -> Result<Option<Range<usize>>> {
             offset += next;
             if source[offset..].starts_with("<!--") {
                 let Some(end) = source[offset + 4..].find("-->") else {
-                    bail!("unclosed literal HTML comment");
+                    return Err(UnclosedHtml.into());
                 };
                 return Ok(Some(offset..offset + 4 + end + 3));
             } else if looks_like_html(&source.as_bytes()[offset..]) {

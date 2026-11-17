@@ -49,8 +49,13 @@ fn io(error: std::io::Error) -> Failure {
     failure.io_kind = Some(format!("{:?}", error.kind()));
     failure
 }
-fn invalid(_: impl std::fmt::Display) -> Failure {
-    fail("invalid", "document or arguments failed validation")
+fn invalid(error: impl Into<anyhow::Error>) -> Failure {
+    let error = error.into();
+    let mut failure = fail("invalid", "document or arguments failed validation");
+    if error.downcast_ref::<super::syntax::UnclosedHtml>().is_some() {
+        failure.reason = Some("UNCLOSED_HTML".into());
+    }
+    failure
 }
 fn binding_failure(error: anyhow::Error) -> Failure {
     if let Some(source) = error.downcast_ref::<std::io::Error>() {

@@ -57,6 +57,129 @@ fn context(root: &Path) -> Value {
 }
 
 #[test]
+fn unclosed_html_create_has_fixed_reason_without_persisted_identity() {
+    for content in [
+        "05-memorias/<UUID>/Memoria.md",
+        "ss_<area>_<action>",
+        "<span>literal",
+        "<!-- literal without terminator",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        init(root);
+        let output = call(
+            root,
+            101,
+            "create",
+            json!({"context":context(root),"title":"Private title","sections":[content,"b","c","d","e"]}),
+        );
+        assert_eq!(output["protocol_version"], 1);
+        assert_eq!(output["request_id"], json!(Uuid::from_u128(101)));
+        assert_eq!(output["operation"], "create");
+        assert_eq!(
+            output["result"],
+            json!({"status":"invalid","reason":"UNCLOSED_HTML","message":"document or arguments failed validation"})
+        );
+        assert!(!root.join("work/.brain.toml").exists());
+        assert!(!root.join("work/.brain.pending.toml").exists());
+        assert!(!root.join("vault/05-memorias").exists());
+        assert_eq!(
+            call(root, 102, "resolve", context(root))["result"]["status"],
+            "unbound"
+        );
+    }
+}
+
+#[test]
+fn literal_placeholders_and_h3_remain_valid_without_normalization() {
+    for content in [
+        "`05-memorias/<UUID>/Memoria.md` and `ss_<area>_<action>`",
+        r"05-memorias/\<UUID\>/Memoria.md and ss_\<area\>_\<action\>",
+        "### Detail\nOrdinary content",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        init(root);
+        let saved = call(
+            root,
+            103,
+            "create",
+            json!({"context":context(root),"title":"Valid syntax","sections":[content,"b","c","d","e"]}),
+        );
+        assert_eq!(saved["result"]["status"], "saved");
+        let read = call(
+            root,
+            104,
+            "read",
+            json!({"memory_id":saved["result"]["memory_id"]}),
+        );
+        assert_eq!(read["result"]["status"], "found");
+        assert!(
+            read["result"]["accepted_markdown"]
+                .as_str()
+                .unwrap()
+                .contains(content)
+        );
+    }
+}
+
+#[test]
+fn unclosed_html_update_preserves_baseline_and_other_rejections_stay_generic() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    init(root);
+    let saved = call(
+        root,
+        105,
+        "create",
+        json!({"context":context(root),"title":"Baseline","sections":["a","b","c","d","e"]}),
+    );
+    assert_eq!(saved["result"]["status"], "saved");
+    let id = saved["result"]["memory_id"].clone();
+    let read = call(root, 106, "read", json!({"memory_id":id}));
+    let accepted = read["result"]["accepted_markdown"].as_str().unwrap();
+    let document = brain::memory::markdown::MemoryDocument::parse(
+        serde_json::from_value(id.clone()).unwrap(),
+        accepted,
+    )
+    .unwrap();
+    let dir = root.join("vault/05-memorias").join(id.as_str().unwrap());
+    let current = fs::read(dir.join("Memoria.md")).unwrap();
+    let history = fs::read(dir.join("Historial.md")).unwrap();
+    let marker = fs::read(root.join("work/.brain.toml")).unwrap();
+    for (suffix, reason) in [
+        ("05-memorias/<UUID>/Memoria.md", Some("UNCLOSED_HTML")),
+        ("<span>literal", Some("UNCLOSED_HTML")),
+        ("<!-- literal without terminator", Some("UNCLOSED_HTML")),
+        ("```text\nunclosed fence", None),
+        ("## Unexpected section", None),
+    ] {
+        let output = call(
+            root,
+            107,
+            "update",
+            json!({"memory_id":id,"expected":{"revision":1,"accepted_markdown":accepted},"body":format!("{}\n{suffix}\n", document.body())}),
+        );
+        let mut expected = json!({"status":"invalid","message":"document or arguments failed validation"});
+        if let Some(reason) = reason {
+            expected["reason"] = json!(reason);
+        }
+        assert_eq!(output["result"], expected);
+        assert_eq!(output["operation"], "update");
+        assert_eq!(output["request_id"], json!(Uuid::from_u128(107)));
+        assert_eq!(fs::read(dir.join("Memoria.md")).unwrap(), current);
+        assert_eq!(fs::read(dir.join("Historial.md")).unwrap(), history);
+        assert_eq!(fs::read(root.join("work/.brain.toml")).unwrap(), marker);
+        assert!(!root.join("work/.brain.pending.toml").exists());
+        assert!(!dir.join(".pending.json").exists());
+    }
+    let after = call(root, 108, "read", json!({"memory_id":id}));
+    assert_eq!(after["result"]["status"], "found");
+    assert_eq!(after["result"]["revision"], 1);
+    assert_eq!(after["result"]["accepted_markdown"], accepted);
+}
+
+#[test]
 fn capabilities_needs_neither_vault_nor_profile_and_correlates() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

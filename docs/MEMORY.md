@@ -107,7 +107,13 @@ A genuine link alongside inactive examples does qualify. Existing valid snapshot
 with ordinary lists/quotes remain readable without rewriting accepted bytes.
 
 Exactly five ordered canonical **top-level** `## <name>` lines are required;
-nested headings do not substitute for them. Unclosed fences, multiline/unclosed
+nested headings do not substitute for them. Additional `###` headings are allowed;
+they do not replace the canonical H2s. Write placeholder examples such as
+`05-memorias/<UUID>/Memoria.md` and `ss_<area>_<action>` in inline code (or
+escape their angle brackets). Bare `<UUID>` is interpreted as an HTML element,
+not a placeholder, and without a matching closer is rejected. No escaping or
+normalization is performed on behalf of the caller.
+Unclosed fences, multiline/unclosed
 HTML tags and Setext/dash-only separator syntax retain their conservative
 rejection policy; use `***` for a divider. A validation-only, equal-byte-length
 view interprets bare CR as a newline alongside LF/CRLF; source offsets still
@@ -434,6 +440,30 @@ host: inform and offer **new** creation/reassociation separately via explicit
 `replace_missing`; never silently replace the marker or emulate it in SS by
 unlinking/rewriting marker files. Access/vault/I/O failures are not `not_found`. `io_kind`, when
 available, preserves the OS error category without leaking context in diagnostics.
+
+Validation failures caused by a literal HTML element still open at end of body,
+or a parser-recognized HTML comment without its source-level `-->`, return:
+
+```json
+{"status":"invalid","message":"document or arguments failed validation","reason":"UNCLOSED_HTML"}
+```
+
+This fixed category uses the **existing optional `Failure.reason`** field in
+protocol v1, not a new `code` field. It is derived from a typed syntax error, not
+message matching; the diagnostic contains no document fragments, paths or title.
+Other rejection categories retain their existing contract (in particular,
+malformed/multiline tag syntax and unclosed code fences are not recategorized).
+Both `create` and `update` propagate this reason through the ordinary failure
+serializer. Rejected create publishes no identity/binding, reservation or Memory
+files (an internal candidate UUID may already have been generated); rejected
+update preserves the accepted document/history and binding. A host must treat
+`invalid` as unsaved and must not infer a binding or silently retry a save.
+
+Source regressions for this diagnostic, placeholder escaping/inline code, H3
+acceptance and preservation after invalid update are prepared in
+`tests/cli_memory.rs`. They have **not been executed** in this change: tests,
+builds, Brain execution and formatting tooling remain outside the authorized
+verification scope; evidence here is static review and `git diff --check` only.
 
 ### Cancellation and confirmation
 
