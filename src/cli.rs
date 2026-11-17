@@ -15,6 +15,15 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// One bounded versioned JSON request on stdin; no interactive prompts.
+    Memory {
+        /// Transport bound, not a desired Memory size or retention policy.
+        #[arg(long, default_value_t = 4 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1024..=1073741824))]
+        max_input_bytes: u64,
+        /// Output is rejected explicitly rather than truncated.
+        #[arg(long, default_value_t = 4 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1024..=1073741824))]
+        max_output_bytes: u64,
+    },
     ///Crear la estructura base PARA para un vault en Obsidian
     Init {
         ///Directorio donde se creara el vault

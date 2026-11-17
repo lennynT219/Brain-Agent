@@ -18,6 +18,19 @@ pub struct CommonMetadata {
 pub enum DocumentMetadata {
     Note(CommonMetadata),
     Project(CommonMetadata),
+    Memory {
+        #[serde(flatten)]
+        common: CommonMetadata,
+        memory_revision: u64,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_uuid",
+            skip_serializing_if = "Option::is_none"
+        )]
+        brain_project: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_link: Option<String>,
+    },
     Task {
         #[serde(flatten)]
         common: CommonMetadata,
@@ -53,10 +66,39 @@ fn deserialize_uuid<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Uuid, 
     Uuid::parse_str(&value).map_err(|_| serde::de::Error::custom("UUID inválido"))
 }
 
+fn deserialize_optional_uuid<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Uuid>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| Uuid::parse_str(&value).map_err(|_| serde::de::Error::custom("UUID inválido")))
+        .transpose()
+}
+
+/// Scalar syntax only; this does not resolve a note or grant access to it.
+fn qualified_wikilink(link: &str) -> bool {
+    let Some(inner) = link.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) else {
+        return false;
+    };
+    let Some((target, label)) = inner.split_once('|') else {
+        return false;
+    };
+    !label.trim().is_empty()
+        && !label.contains(['[', ']', '|', '\n', '\r'])
+        && target.contains('/')
+        && !target.contains(['[', ']', '|', '\\', ':', '#', '\n', '\r'])
+        && target
+            .split('/')
+            .all(|part| !part.trim().is_empty() && part != "." && part != "..")
+}
+
 impl DocumentMetadata {
     pub fn common(&self) -> &CommonMetadata {
         match self {
-            Self::Note(common) | Self::Project(common) | Self::Task { common, .. } => common,
+            Self::Note(common)
+            | Self::Project(common)
+            | Self::Memory { common, .. }
+            | Self::Task { common, .. } => common,
         }
     }
 
@@ -68,6 +110,26 @@ impl DocumentMetadata {
         }
         if common.title.trim().is_empty() {
             return Err("El título no puede estar vacío");
+        }
+        if let Self::Memory {
+            memory_revision,
+            brain_project,
+            project_link,
+            ..
+        } = self
+        {
+            if common.brain_id.is_nil() || *memory_revision == 0 {
+                return Err("Memoria requiere identidad no nula y revisión positiva");
+            }
+            match (brain_project, project_link) {
+                (None, None) => {}
+                (Some(id), Some(link)) if !id.is_nil() && qualified_wikilink(link) => {}
+                _ => {
+                    return Err(
+                        "Proyecto opcional requiere UUID y enlace cualificado con etiqueta",
+                    );
+                }
+            }
         }
         if let Self::Task { project_link, .. } = self {
             let target = project_link
