@@ -25,8 +25,13 @@ Actual qualified links connect notes, e.g.
 Project document **outside 05-memorias**. No Obsidian settings or graph-layout
 assumptions are required. Association never changes Memory ID/location.
 
-No StelaShell extension, installer, daemon, HTTP/MCP service or WORK_STATE cutover
-is included. `docs/WORK_STATE.md` remains the operational continuity record.
+No StelaShell extension, installer, daemon or HTTP/MCP service is included in
+this repository. Brain is the sole primary project-continuity authority; use
+the host-selected working-context Memory through the StelaShell integration.
+The former `docs/WORK_STATE.md` record was explicitly migrated to that Memory
+and retired; do not recreate it as a fallback, synchronized mirror or parallel
+continuity store. This migration does not authorize migrating other Memories,
+vaults or legacy records.
 Brain's explicit operations are turn-agnostic. The host must resolve/read before
 work on a genuine human prompt and call create only after a useful successful
 response; startup/greetings/empty/failed/cancelled turns are not creation events.
