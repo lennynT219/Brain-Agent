@@ -24,6 +24,8 @@ pub enum Command {
         #[arg(long, default_value_t = 4 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1024..=1073741824))]
         max_output_bytes: u64,
     },
+    /// One bounded JSON request for the Project Notes bound to the current directory.
+    Notes,
     ///Crear la estructura base PARA para un vault en Obsidian
     Init {
         ///Directorio donde se creara el vault

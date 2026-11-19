@@ -30,6 +30,13 @@ vault_path = '/ruta/absoluta/al/vault'
 `config_version` indica la versión compatible; `vault_path` es el vault completo.
 `config show` lee y valida ambos campos sin crear ni reparar archivos.
 
+## Notas de proyecto
+
+`brain notes` es la interfaz JSON local para listar, leer, crear y actualizar
+notas de un solo proyecto seleccionado por el operador. Consulta el
+[contrato de Notas](docs/NOTES.md) para configurar un contexto y separar el
+permiso de escritura de la lectura. No usa ni modifica la interfaz de Memory.
+
 ## Prueba manual aislada (shell Unix)
 
 Compila con `cargo build` **antes** de aislar las variables; no exportes `HOME` para Cargo.
