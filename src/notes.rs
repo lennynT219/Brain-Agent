@@ -11,16 +11,22 @@ use std::{
 };
 use uuid::Uuid;
 
-const MARKER: &str = ".brain-notes.toml";
 const LOCK: &str = ".brain-notes.lock";
 const MAX_ENTRIES: usize = 256;
 const MAX_DOCUMENT: usize = 512 * 1024;
-const MAX_MARKER: usize = 8 * 1024;
 const MAX_TITLE: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct Failure(pub(crate) &'static str, pub(crate) &'static str);
 type Result<T> = std::result::Result<T, Failure>;
+
+fn project_failure(error: crate::memory::store::Failure) -> Failure {
+    let status = match error.status.as_str() {
+        "invalid" => "invalid", "unbound" => "unbound", "conflict" => "conflict",
+        "not_found" => "not_found", "busy" => "busy", "denied" => "denied", _ => "unavailable",
+    };
+    Failure(status, "Project binding or selected Project is unavailable")
+}
 
 fn unavailable(message: &'static str) -> Failure {
     Failure("unavailable", message)
@@ -80,7 +86,7 @@ fn is_regular(metadata: &Metadata) -> bool {
     metadata.is_file()
 }
 
-fn read_regular(path: &Path, limit: usize) -> Result<String> {
+pub(crate) fn read_regular(path: &Path, limit: usize) -> Result<String> {
     // This is a local, trusted-directory boundary, not an OS sandbox against
     // concurrent substitution of directory entries by an untrusted process.
     if !fs::symlink_metadata(path).is_ok_and(|m| is_regular(&m)) {
@@ -104,7 +110,7 @@ struct HeaderKind {
 
 /// Ignore unmanaged Markdown and other typed documents. A malformed header is
 /// not silently dropped: it may contain a duplicate identity or another Project.
-fn metadata(markdown: &str, kind: &str) -> Result<Option<(DocumentMetadata, usize)>> {
+pub(crate) fn metadata(markdown: &str, kind: &str) -> Result<Option<(DocumentMetadata, usize)>> {
     let Some(tail) = markdown
         .strip_prefix("---\n")
         .or_else(|| markdown.strip_prefix("---\r\n"))
@@ -134,7 +140,7 @@ fn metadata(markdown: &str, kind: &str) -> Result<Option<(DocumentMetadata, usiz
     Err(unavailable("unterminated document frontmatter"))
 }
 
-fn direct_markdown(dir: &Path) -> Result<(Vec<PathBuf>, usize)> {
+pub(crate) fn direct_markdown(dir: &Path) -> Result<(Vec<PathBuf>, usize)> {
     let mut files = Vec::new();
     let mut entries = 0;
     for entry in
@@ -169,22 +175,20 @@ fn direct_markdown(dir: &Path) -> Result<(Vec<PathBuf>, usize)> {
 
 impl Scope {
     pub(crate) fn load() -> Result<Self> {
-        let cwd =
-            std::env::current_dir().map_err(|_| unavailable("cannot resolve host context"))?;
-        let marker = cwd.join(MARKER);
-        match fs::symlink_metadata(&marker) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(Failure(
-                    "unbound",
-                    "no Notes binding in the host working directory",
-                ));
-            }
-            Err(_) => return Err(unavailable("cannot inspect Notes binding")),
-            Ok(_) => {}
-        }
-        let input = read_regular(&marker, MAX_MARKER)?;
-        let binding: Binding =
-            toml::from_str(&input).map_err(|_| unavailable("invalid Notes binding"))?;
+        let principal = crate::projects::notes_principal().map_err(project_failure)?
+            .ok_or(Failure("unbound", "no Project binding in the host working directory"))?;
+        Self::load_binding(Binding { binding_version: 1, project_id: principal.project_id,
+            project_path: principal.project_path, allow_write: principal.allow_write })
+    }
+
+    /// Explicit additional Project selection never enables writes.
+    pub(crate) fn load_additional(project_id: Uuid) -> Result<Self> {
+        let vault = crate::projects::vault().map_err(project_failure)?;
+        let project = crate::projects::find(&vault, project_id).map_err(project_failure)?;
+        Self::load_binding(Binding { binding_version: 1, project_id, project_path: project.path, allow_write: false })
+    }
+
+    fn load_binding(binding: Binding) -> Result<Self> {
         let parts: Vec<_> = binding.project_path.split('/').collect();
         if binding.binding_version != 1
             || binding.project_id.is_nil()
@@ -210,6 +214,8 @@ impl Scope {
             .vault_path
             .canonicalize()
             .map_err(|_| unavailable("cannot resolve configured vault"))?;
+        let active = crate::projects::find(&vault, binding.project_id).map_err(project_failure)?;
+        if active.path != binding.project_path { return Err(Failure("conflict", "Project binding path changed")); }
         let projects = vault.join(parts[0]);
         ensure_directory(&projects)?;
         let project_dir = projects.join(parts[1]);

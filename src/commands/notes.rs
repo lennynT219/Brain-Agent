@@ -17,12 +17,17 @@ struct Request {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Empty {}
+struct ListNotes {
+    #[serde(default)]
+    project_id: Option<Uuid>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadNote {
     note_id: Uuid,
+    #[serde(default)]
+    project_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -55,13 +60,19 @@ fn dispatch(request: Request) -> Result<Value, Failure> {
     }
     match request.operation.as_str() {
         "list" => {
-            arguments::<Empty>(request.arguments)?;
-            Scope::load()?.list()
+            let ListNotes { project_id } = arguments(request.arguments)?;
+            match project_id {
+                Some(id) => { notes::validate_id(id)?; Scope::load_additional(id)?.list() }
+                None => Scope::load()?.list(),
+            }
         }
         "read" => {
-            let ReadNote { note_id } = arguments(request.arguments)?;
+            let ReadNote { note_id, project_id } = arguments(request.arguments)?;
             notes::validate_id(note_id)?;
-            Scope::load()?.read(note_id)
+            match project_id {
+                Some(id) => { notes::validate_id(id)?; Scope::load_additional(id)?.read(note_id) }
+                None => Scope::load()?.read(note_id),
+            }
         }
         "create" => {
             let CreateNote {

@@ -27,9 +27,8 @@ fn uuid_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Uuid, D::Er
 
 impl Binding {
     pub fn parse(input: &str) -> Result<Self> {
-        let binding: Self = toml::from_str(input).context("invalid binding TOML")?;
-        binding.validate()?;
-        Ok(binding)
+        let marker = crate::project_binding::Marker::parse(input)?;
+        marker.memory_binding().context("marker has no Memory identity")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -58,6 +57,8 @@ impl Binding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     Unbound,
+    /// A confirmed exact-context Project without a Memory yet.
+    ProjectOnly { directory: PathBuf },
     Bound {
         directory: PathBuf,
         binding: Binding,
@@ -124,10 +125,10 @@ pub fn resolve(working_directory: &Path, authorized_boundary: &Path) -> Result<R
                     bail!("binding marker is not a regular file");
                 }
                 let input = fs::read_to_string(&marker).context("cannot read binding marker")?;
-                let binding = Binding::parse(&input)?;
+                let parsed_marker = crate::project_binding::Marker::parse(&input)?;
                 if directory != working {
                     let mut selected: Option<PathBuf> = None;
-                    for child in &binding.memory_subfolders {
+                    for child in &parsed_marker.memory_subfolders {
                         let candidate = directory.join(child);
                         if working.starts_with(&candidate)
                             && selected.as_ref().is_none_or(|old| {
@@ -144,6 +145,9 @@ pub fn resolve(working_directory: &Path, authorized_boundary: &Path) -> Result<R
                         });
                     }
                 }
+                let Some(binding) = parsed_marker.memory_binding() else {
+                    return Ok(Resolution::ProjectOnly { directory: directory.to_path_buf() });
+                };
                 return Ok(Resolution::Bound {
                     directory: directory.to_path_buf(),
                     binding,

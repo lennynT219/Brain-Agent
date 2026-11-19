@@ -33,9 +33,23 @@ vault_path = '/ruta/absoluta/al/vault'
 ## Notas de proyecto
 
 `brain notes` es la interfaz JSON local para listar, leer, crear y actualizar
-notas de un solo proyecto seleccionado por el operador. Consulta el
+notas del proyecto principal seleccionado por el operador, con lectura explícita
+de proyectos adicionales sin habilitar escritura en ellos. Consulta el
 [contrato de Notas](docs/NOTES.md) para configurar un contexto y separar el
-permiso de escritura de la lectura. No usa ni modifica la interfaz de Memory.
+permiso de escritura de la lectura. Notes no modifica la interfaz de Memory.
+
+## Selección explícita de Project
+
+`brain projects` expone JSON v1 para listar Projects activos, consultar una ficha,
+previsualizar creación y confirmar el vínculo principal del cwd exacto. Usa
+`.brain.toml` unificado v2, con lectura compatible de marcadores v1 y Notes legado,
+sin migración implícita. Asocia la Memory existente sin recrearla, o difiere su
+creación hasta el primer guardado útil. También permite leer una porción acotada
+del historial de la Memory seleccionada para un borrador autorizado por el host.
+
+El [contrato de Projects](docs/PROJECTS.md) define argumentos, recibos, confirmación,
+preflight de baseline, límites, acceso adicional de solo lectura y parcialidad.
+No implementa la UI de Pi ni concede permisos por recibir un UUID o un booleano.
 
 ## Prueba manual aislada (shell Unix)
 

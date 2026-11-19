@@ -26,6 +26,8 @@ pub enum Command {
     },
     /// One bounded JSON request for the Project Notes bound to the current directory.
     Notes,
+    /// Explicit Project preview, selection and binding for the host cwd.
+    Projects,
     ///Crear la estructura base PARA para un vault en Obsidian
     Init {
         ///Directorio donde se creara el vault

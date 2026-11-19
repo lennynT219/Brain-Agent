@@ -260,6 +260,35 @@ pub struct Store {
     vault: PathBuf,
     fault: Fault,
 }
+
+/// Held only during explicit Project binding; never allocates a Memory.
+pub(crate) struct ProjectGuard<'a> {
+    store: &'a Store,
+    baseline: Option<(PathBuf, Lock, Expected, MemoryDocument)>,
+}
+impl ProjectGuard<'_> {
+    pub(crate) fn prepare(&self, project: &ProjectAssociation) -> Result<()> {
+        if let Some((_, _, _, document)) = &self.baseline {
+            document.with_project(project).map_err(invalid)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn associate(&self, request: Uuid, project: &ProjectAssociation) -> Result<serde_json::Value> {
+        let Some((dir, _, expected, document)) = &self.baseline else {
+            return Ok(serde_json::json!({"status":"deferred"}));
+        };
+        let id = document.metadata.common().brain_id;
+        self.store.check_expected(id, dir, expected, false)?;
+        self.store.validate_project(project)?;
+        let next = document.with_project(project).map_err(invalid)?;
+        if next.raw == document.raw {
+            return Ok(serde_json::json!({"status":"unchanged","memory_id":id,"revision":document.revision}));
+        }
+        let receipt = self.store.successor(dir, request, &document.raw, &document.raw, next,
+            Some("Se actualizó la asociación explícita al Project principal."))?;
+        Ok(serde_json::json!({"status":"associated","memory_id":id,"revision":receipt.revision}))
+    }
+}
 impl Store {
     pub fn open(vault: &Path) -> Result<Self> {
         crate::vault::validate_vault(vault).map_err(|error| {
@@ -276,6 +305,8 @@ impl Store {
             fault: Fault::None,
         })
     }
+    pub(crate) fn vault_directory(&self) -> &Path { &self.vault }
+
     pub fn with_fault(mut self, fault: Fault) -> Self {
         self.fault = fault;
         self
@@ -319,6 +350,9 @@ impl Store {
         match resolution {
             Resolution::Unbound => Ok(
                 serde_json::json!({"status":"unbound", "directory":context.working_directory.canonicalize().map_err(io)?}),
+            ),
+            Resolution::ProjectOnly { directory } => Ok(
+                serde_json::json!({"status":"unbound", "directory":directory}),
             ),
             Resolution::Declared {
                 directory,
@@ -448,6 +482,44 @@ impl Store {
         ))
     }
 
+    pub(crate) fn with_project_guard<T>(&self, context: &Context, expected: &serde_json::Value,
+        callback: impl FnOnce(&ProjectGuard<'_>) -> Result<T>) -> Result<T> {
+        if self.resolve(context)? != *expected {
+            return Err(fail("conflict", "selected Memory baseline changed"));
+        }
+        let baseline = match expected.get("status").and_then(|v| v.as_str()) {
+            Some("unbound") => None,
+            Some("found") => {
+                let state: State = serde_json::from_value(expected["memory"].clone()).map_err(invalid)?;
+                let expected = Expected { revision: state.revision.ok_or_else(|| fail("partial", "missing revision"))?,
+                    accepted_markdown: state.accepted_markdown.ok_or_else(|| fail("partial", "missing accepted bytes"))? };
+                let (dir, lock) = self.lock(state.memory_id, false)?;
+                self.check_expected(state.memory_id, &dir, &expected, false)?;
+                let document = MemoryDocument::parse(state.memory_id, &expected.accepted_markdown).map_err(invalid)?;
+                Some((dir, lock, expected, document))
+            }
+            Some("manual_review") => return Err(fail("manual_review", "external edits require review before binding")),
+            _ => return Err(fail("partial", "selected Memory is not a complete baseline")),
+        };
+        callback(&ProjectGuard { store: self, baseline })
+    }
+
+    /// Response-bounded tail of only the selected Memory's validated history.
+    /// Baseline validation retains its existing full-file IO behavior.
+    pub(crate) fn selected_history(&self, context: &Context, expected: &serde_json::Value, max_bytes: usize) -> Result<serde_json::Value> {
+        self.with_project_guard(context, expected, |guard| {
+            let Some((dir, _, _, _)) = &guard.baseline else {
+                return Err(fail("unavailable", "selected context has no Memory history"));
+            };
+            let raw = read_optional(&dir.join("Historial.md"))?.ok_or_else(|| fail("unavailable", "history missing"))?;
+            let mut start = raw.len().saturating_sub(max_bytes);
+            while !raw.is_char_boundary(start) { start += 1; }
+            let text = &raw[start..];
+            Ok(serde_json::json!({"status":"found","format":if change_log::is_log(&raw) {2} else {1},
+                "markdown":text,"returned_bytes":text.len(),"total_bytes":raw.len(),"truncated":start != 0}))
+        })
+    }
+
     pub fn create(&self, request: Uuid, args: Create) -> Result<Saved> {
         self.create_with_history(request, args, None)
     }
@@ -476,7 +548,7 @@ impl Store {
         .map_err(binding_failure)?;
         let target = match resolution {
             Resolution::Unbound => args.context.working_directory.canonicalize().map_err(io)?,
-            Resolution::Declared { directory, .. } => directory,
+            Resolution::Declared { directory, .. } | Resolution::ProjectOnly { directory } => directory,
             Resolution::Bound { binding, .. } => {
                 let mut f = fail(
                     "conflict",
@@ -512,7 +584,12 @@ impl Store {
             }
             _ => {}
         }
-        self.create_target(request, args, &target, None, summary)
+        let before_marker = read_optional(&target.join(binding::MARKER_NAME))?;
+        if let Some(raw) = &before_marker {
+            let marker = crate::project_binding::Marker::parse(raw).map_err(invalid)?;
+            if marker.memory_id.is_some() { return Err(fail("conflict", "Memory binding appeared")); }
+        }
+        self.create_target(request, args, &target, before_marker, summary)
     }
 
     /// New identity for exactly one approved existing marker whose old UUID
@@ -577,11 +654,25 @@ impl Store {
     fn create_target(
         &self,
         request: Uuid,
-        args: Create,
+        mut args: Create,
         target: &Path,
         before_marker: Option<String>,
         summary: Option<&str>,
     ) -> Result<Saved> {
+        if let Some(raw) = &before_marker {
+            let marker = crate::project_binding::Marker::parse(raw).map_err(invalid)?;
+            if let Some(principal) = &marker.principal_project {
+                let project = crate::projects::association(&self.vault, principal.project_id)?;
+                if project.path != principal.project_path {
+                    return Err(fail("conflict", "principal Project path changed"));
+                }
+                if args.project.as_ref().is_some_and(|p| *p != project) {
+                    return Err(fail("conflict", "Memory Project differs from confirmed principal"));
+                }
+                args.project = Some(project);
+            }
+            args.memory_subfolders = marker.memory_subfolders;
+        }
         if let Some(project) = &args.project {
             self.validate_project(project)?;
         }
@@ -613,7 +704,7 @@ impl Store {
             toml::to_string(&binding).map_err(invalid)?
         };
         if let Some(before) = &before_marker
-            && Binding::parse(before).map_err(invalid)?.memory_id == id
+            && crate::project_binding::Marker::parse(before).map_err(invalid)?.memory_id == Some(id)
         {
             return Err(fail(
                 "conflict",
@@ -976,7 +1067,8 @@ impl Store {
                 ));
             }
             if let Some(before) = &pending.before_marker {
-                let old = Binding::parse(before).map_err(invalid)?.memory_id;
+                let old = crate::project_binding::Marker::parse(before).map_err(invalid)?.memory_id;
+                if let Some(old) = old {
                 let record = Reassociation {
                     version: 1,
                     request_id: pending.request_id,
@@ -993,6 +1085,7 @@ impl Store {
                     Some(_) => {}
                     None => publish(&dir.join(REASSOCIATION), &raw, false)?,
                 }
+                }
                 if existing.as_ref() != Some(marker) {
                     if existing.as_ref() != Some(before) {
                         return Err(fail(
@@ -1000,7 +1093,7 @@ impl Store {
                             "old marker was changed or removed; no restore/overwrite",
                         ));
                     }
-                    self.require_missing(old)?;
+                    if let Some(old) = old { self.require_missing(old)?; }
                     self.hit(Fault::BeforeMarker, pending.memory_id)?;
                     if read_optional(&path)?.as_ref() != Some(before) {
                         return Err(fail("conflict", "marker changed before replacement"));
@@ -1055,9 +1148,10 @@ impl Store {
             replaced_memory_id: pending
                 .before_marker
                 .as_ref()
-                .map(|raw| Binding::parse(raw).map(|b| b.memory_id))
+                .map(|raw| crate::project_binding::Marker::parse(raw).map(|b| b.memory_id))
                 .transpose()
-                .map_err(invalid)?,
+                .map_err(invalid)?
+                .flatten(),
         })
     }
 
@@ -1201,14 +1295,14 @@ impl Store {
             ));
         }
         if let Some(before) = &p.before_marker {
-            let old = Binding::parse(before).map_err(invalid)?;
+            let old = crate::project_binding::Marker::parse(before).map_err(invalid)?;
             let next_marker = p
                 .marker
                 .as_deref()
                 .ok_or_else(|| fail("partial", "replacement intent has no next marker"))?;
             if p.before_current.is_some()
                 || p.before_history.is_some()
-                || old.memory_id == id
+                || old.memory_id == Some(id)
                 || replace_marker_identity(before, id)? != next_marker
             {
                 return Err(fail(
@@ -1278,7 +1372,13 @@ impl Store {
             &p.before_head,
             &p.marker,
         ) {
-            (None, None, None, Some(marker)) if p.before_marker.is_none() => {
+            (None, None, None, Some(marker)) => {
+                if let Some(before) = &p.before_marker {
+                    let old = crate::project_binding::Marker::parse(before).map_err(invalid)?;
+                    if old.memory_id.is_some() || replace_marker_identity(before, id)? != *marker {
+                        return Err(bad());
+                    }
+                }
                 if log.len() != 1
                     || tip.revision != 1
                     || Binding::parse(marker).map_err(invalid)?.memory_id != id
@@ -1568,12 +1668,17 @@ fn replace_marker_identity(before: &str, next: Uuid) -> Result<String> {
     struct Span {
         memory_id: toml::Spanned<String>,
     }
-    let old = Binding::parse(before).map_err(invalid)?;
-    let span: Span = toml::from_str(before).map_err(invalid)?;
+    let old = crate::project_binding::Marker::parse(before).map_err(invalid)?;
     let mut result = before.to_owned();
-    result.replace_range(span.memory_id.span(), &format!("\"{next}\""));
-    let parsed = Binding::parse(&result).map_err(invalid)?;
-    if parsed.memory_id != next || parsed.memory_subfolders != old.memory_subfolders {
+    if old.memory_id.is_some() {
+        let span: Span = toml::from_str(before).map_err(invalid)?;
+        result.replace_range(span.memory_id.span(), &format!("\"{next}\""));
+    } else {
+        result.insert_str(0, &format!("memory_id = \"{next}\"\n"));
+    }
+    let parsed = crate::project_binding::Marker::parse(&result).map_err(invalid)?;
+    if parsed.memory_id != Some(next) || parsed.memory_subfolders != old.memory_subfolders
+        || parsed.principal_project != old.principal_project {
         return Err(fail(
             "invalid",
             "marker identity replacement did not preserve declarations",

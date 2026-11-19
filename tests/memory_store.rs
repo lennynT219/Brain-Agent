@@ -699,3 +699,41 @@ fn change_log_recovers_exact_intents_and_manual_edits_still_require_approval() {
         assert_eq!(history.matches("\n- ").count(), 2);
     }
 }
+
+#[test]
+fn project_only_v2_first_use_recovers_without_replacing_identity_or_principal() {
+    for log in [false, true] {
+        for fault in [Fault::AfterPending, Fault::AfterCurrent, Fault::AfterHistory,
+            Fault::AfterHead, Fault::BeforeMarker, Fault::AfterMarker, Fault::AfterReservationCleanup] {
+            if !log && fault == Fault::AfterHead { continue; }
+            let temp = tempfile::tempdir().unwrap();
+            let vault = vault(temp.path());
+            let ctx = context(temp.path());
+            let project_id = request(300);
+            let project = vault.join("01-proyectos/Principal");
+            fs::create_dir_all(project.join("notas")).unwrap();
+            fs::write(project.join("Proyecto.md"), format!("---\nbrain_type: project\nbrain_version: 1\nbrain_id: {project_id}\ntitle: Principal\n---\nProyecto\n")).unwrap();
+            let marker = format!("# conservar\nbinding_version=2\nmemory_subfolders=['child']\n[principal_project]\nproject_id='{project_id}'\nproject_path='01-proyectos/Principal/Proyecto.md'\nallow_write=true\n");
+            let marker_path = ctx.working_directory.join(".brain.toml");
+            fs::write(&marker_path, &marker).unwrap();
+            let store = Store::open(&vault).unwrap();
+            assert_eq!(store.resolve(&ctx).unwrap()["status"], "unbound");
+            let faulty = Store::open(&vault).unwrap().with_fault(fault);
+            let result = if log { faulty.create_log(request(301), create(&ctx), "Inicio útil.") }
+                else { faulty.create(request(301), create(&ctx)) };
+            let error = result.unwrap_err();
+            assert_eq!(error.status, "partial");
+            let id = error.memory_id.unwrap();
+            assert_eq!(store.resolve(&ctx).unwrap()["status"], "partial");
+            let observation = store.inspect_recovery(id, Some(&ctx)).unwrap();
+            store.recover(id, Some(&ctx), observation, true).unwrap();
+            let current = expected(&store, id);
+            assert!(current.accepted_markdown.contains(&project_id.to_string()));
+            let published = fs::read_to_string(marker_path).unwrap();
+            assert!(published.ends_with(&marker));
+            assert_eq!(Binding::parse(&published).unwrap().memory_id, id);
+            assert!(!path(&vault, id, ".reassociation.json").exists());
+            assert_eq!(store.resolve(&ctx).unwrap()["binding"]["binding_version"], 1);
+        }
+    }
+}

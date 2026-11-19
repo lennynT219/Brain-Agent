@@ -5,6 +5,8 @@ mod cli;
 mod commands;
 mod config;
 mod notes;
+mod project_binding;
+mod projects;
 mod vault;
 
 /// Existing interactive commands and the opt-in local JSON adapter.
@@ -15,6 +17,7 @@ pub fn run_cli() -> anyhow::Result<()> {
         Command::Init { path, dry_run } => commands::init::execute(path, dry_run),
         Command::Config { command } => commands::config::execute(command),
         Command::Notes => commands::notes::execute(),
+        Command::Projects => commands::projects::execute(),
         Command::Memory {
             max_input_bytes,
             max_output_bytes,

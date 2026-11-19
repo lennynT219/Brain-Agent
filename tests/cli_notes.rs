@@ -181,7 +181,8 @@ fn reads_only_direct_notes_in_exactly_bound_project() {
     )
     .unwrap();
     fs::create_dir(f.notes.join("carpeta.md")).unwrap();
-    fs::write(f.context.join(".brain.toml"), "not the Notes binding").unwrap();
+    // A valid Memory-only v1 marker is not a principal Project binding.
+    fs::write(f.context.join(".brain.toml"), format!("binding_version=1\nmemory_id='{OTHER_PROJECT}'\n")).unwrap();
     assert_eq!(f.call("list", json!({}))["status"], "unbound");
     f.bind(None);
     let nested_context = f.context.join("sub");

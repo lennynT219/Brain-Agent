@@ -142,7 +142,12 @@ scalars) may parse but cannot be silently rewritten: update returns `invalid`
 requiring a separately reviewed correction. No content is normalized away.
 
 Normal updates cannot change title/Project/unknown frontmatter as a side effect.
-Explicit manual review/import can accept those changes after validation. An
+Explicit manual review/import can accept those changes after validation. The
+separate host-confirmed `brain projects bind/create_and_bind` workflow can also
+associate/reassociate the selected Memory using the existing publication pipeline,
+without recreating it or using missing-reference replacement. See
+[PROJECTS.md](PROJECTS.md) for the exact JSON contract, bounded selected-history
+read, conservative owned-field changes and explicit partial-publication limits. An
 associated Project is checked at its explicit safe vault-relative `.md` path,
 including its UUID/type. No other notes or link targets are automatically read.
 
@@ -154,7 +159,13 @@ memory_id = "550e8400-e29b-41d4-a716-446655440000"
 memory_subfolders = ["child", "nested/child"] # optional explicit relative paths
 ```
 
-`.brain.toml` contains no vault/content/history/Project/permissions/executable.
+The v1 `.brain.toml` format above contains no vault/content/history/Project/
+permissions/executable. The explicit Projects workflow additionally supports a
+unified v2 marker with optional `memory_id` and a confirmed `principal_project`;
+reading never implicitly migrates v1 or the legacy Notes marker. Memory resolve
+keeps the same wire v1 projection for a bound Memory. V2 without Memory is unbound,
+and the first useful create inherits the validated principal without creating an
+empty Memory during bind. See [PROJECTS.md](PROJECTS.md).
 Unknown fields, nil UUIDs, unsupported versions, duplicate declarations,
 traversal, absolute paths, glob syntax and nonportable separators are rejected.
 
@@ -182,7 +193,9 @@ The stable lock sidecar can remain after failed admission; it is not a Memory.
 
 ### Explicit replacement of a genuinely missing reference
 
-Ordinary `create` still never overwrites an existing marker. The separate
+Ordinary `create` still never replaces an existing Memory identity. An explicitly
+confirmed v2 Project-only marker is completed in place with its first Memory UUID,
+using exact prior marker bytes in reservation/intent and preserving its principal. The separate
 library `Store::replace_missing` / CLI `replace_missing` operation requires
 `human_approved:true`, the authorized context, actual `binding_directory`, old
 `expected_memory_id`, **exact `expected_marker` bytes**, and proposed title/five

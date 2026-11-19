@@ -2,14 +2,20 @@
 
 `brain notes` intercambia un objeto JSON por invocación: solicitud hasta EOF en
 stdin, respuesta en una línea en stdout. No muestra preguntas. Es una superficie
-separada de `brain memory`; no busca ni cambia una vinculación de Memory.
+separada de `brain memory`; Notes no modifica una vinculación de Memory.
+El flujo explícito `brain projects` sí puede seleccionar principal y asociar Memory:
+ver [PROJECTS.md](PROJECTS.md).
 
 ## Configuración del operador
 
 El host elige el directorio de trabajo efectivo y el perfil de Brain. Un operador
-con autoridad configura el vault con `brain config` y crea `.brain-notes.toml`
-**en el directorio de trabajo exacto**. No hay búsqueda en ancestros, fallback,
-creación de contexto ni lectura de marcadores de Memory. La solicitud no admite
+con autoridad configura el vault con `brain config`. El principal confirmado se
+lee del `.brain.toml` unificado v2 **en el directorio de trabajo exacto**. Sin v2,
+se conserva la lectura del `.brain-notes.toml` v1 legado mostrado abajo. Leer no migra
+marcadores; v2 inválido/incompleto nunca hace fallback al legado. V2 válido deja el
+legacy inactivo, sin exigir su lectura. No hay búsqueda en ancestros ni creación de
+contexto por leer Notes. Un marcador Memory v1 válido por sí solo no concede acceso
+a un Project. La solicitud no admite
 rutas, flags, entorno ni elección de vault. Un adaptador no debe ofrecer al modelo
 la edición del marcador, la selección del perfil o una vía de ejecución libre
 como sustituto del permiso de escritura.
@@ -26,7 +32,8 @@ componentes. El archivo debe ser Markdown UTF-8, `brain_type: project`, con
 `brain_version` compatible y `brain_id` igual a `project_id`. No puede haber
 otro documento `project` directo en la misma carpeta. La carpeta `notas/`, hija
 directa del Project, debe existir. Para habilitar escritura, el operador debe
-optar por `allow_write = true` (omitirlo equivale a `false`). Una integración
+optar por `allow_write = true` en el legado (omitirlo equivale a `false`). El bind
+unificado confirmado lo habilita por defecto solo en el principal. Una integración
 puede y debe aplicar su propio permiso de escritura antes de invocar Brain.
 
 La pertenencia se define por **ubicación física en ese `notas/` dedicado** y
@@ -55,11 +62,14 @@ rechazan.
 
 | Operación | `arguments` | `result` exitoso |
 |---|---|---|
-| `list` | `{}` | `status: "listed"`, `project_id`, `notes: [{note_id, title}]` |
-| `read` | `{note_id}` | `status: "found"`, `project_id`, `note_id`, `title`, `markdown`, `body` |
+| `list` | `{project_id?:UUID}` | `status: "listed"`, `project_id`, `notes: [{note_id, title}]` |
+| `read` | `{note_id, project_id?:UUID}` | `status: "found"`, `project_id`, `note_id`, `title`, `markdown`, `body` |
 | `create` | `{project_id, title, body}` | `status: "created"`, `project_id`, `note_id`, `title` |
 | `update` | `{project_id, note_id, expected_markdown, body}` | `status: "updated"` o `"unchanged"`, `project_id`, `note_id`, `title` |
 
+- En `list/read`, un `project_id` explícito permite una fuente adicional activa
+  validada por identidad dentro de `01-proyectos`; ese scope es siempre de lectura.
+  Sin ID se usa el principal. `create/update` nunca usan scopes adicionales.
 - `list` no incluye rutas ni cuerpos. `read` retorna el documento UTF-8 exacto
   en `markdown` y el cuerpo sin frontmatter en `body`. El host conserva el
   `markdown` exacto de la lectura que sirve de base, sin normalizar saltos de

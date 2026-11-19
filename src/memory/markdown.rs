@@ -163,6 +163,76 @@ impl MemoryDocument {
         Ok(parsed)
     }
 
+    /// Explicit Project association changes only owned scalars, revision and
+    /// a delimited body relation. Existing human references remain untouched.
+    pub(crate) fn with_project(&self, project: &ProjectAssociation) -> Result<Self> {
+        let DocumentMetadata::Memory { brain_project, project_link, .. } = &self.metadata else {
+            bail!("not a Memory");
+        };
+        let link = project.link();
+        if *brain_project == Some(project.brain_project) && project_link.as_deref() == Some(&link) {
+            return Ok(self.clone());
+        }
+        let prefix = &self.raw[..self.frontmatter_end];
+        let mut header = String::new();
+        let mut ids = 0;
+        let mut links = 0;
+        for line in prefix.split_inclusive('\n') {
+            if line.starts_with("brain_project:") || line.starts_with("project_link:") {
+                if line.contains('#') || line.trim_end().ends_with(['|', '>']) {
+                    bail!("Project scalar spelling requires explicit review");
+                }
+                if line.starts_with("brain_project:") { ids += 1; } else { links += 1; }
+            } else { header.push_str(line); }
+        }
+        if ids > 1 || links > 1 || (brain_project.is_some() && (ids != 1 || links != 1)) {
+            bail!("Project scalar spelling requires explicit review");
+        }
+        // Ensure a block scalar/quoted key was not accidentally consumed.
+        let parsed: DocumentMetadata = serde_saphyr::from_str(header.trim_start_matches("---").trim_start())?;
+        if let DocumentMetadata::Memory { brain_project, project_link, .. } = parsed
+            && (brain_project.is_some() || project_link.is_some()) {
+            bail!("Project scalars could not be isolated");
+        }
+        let newline = if self.raw.starts_with("---\r\n") { "\r\n" } else { "\n" };
+        if !header.ends_with('\n') { header.push_str(newline); }
+        header.push_str(&format!("brain_project: {}{newline}project_link: {}{newline}",
+            project.brain_project, serde_json::to_string(&link)?));
+        let start = "<!-- brain:principal-project -->";
+        let end = "<!-- /brain:principal-project -->";
+        let block = format!("{start}{newline}{link}{newline}{end}");
+        let mut body = self.body().to_owned();
+        match (body.find(start), body.find(end)) {
+            (None, None) => {
+                let (_, headings) = super::syntax::topology(&body)?;
+                body.insert_str(headings[2], &format!("{block}{newline}{newline}"));
+            }
+            (Some(a), Some(b)) if a < b && body.matches(start).count() == 1 && body.matches(end).count() == 1 => {
+                let (_, headings) = super::syntax::topology(&body)?;
+                let genuine = |position: usize, marker: &str| {
+                    position > 0 && body.as_bytes()[position - 1] == b'\n'
+                        && pulldown_cmark::Parser::new(&body).into_offset_iter().any(|(event, range)| {
+                            matches!(event, pulldown_cmark::Event::Html(ref text) | pulldown_cmark::Event::InlineHtml(ref text)
+                                if range.start == position && text.trim_end_matches(['\r', '\n']) == marker)
+                        })
+                };
+                if a < headings[1] || b >= headings[2] || !genuine(a, start) || !genuine(b, end) {
+                    bail!("managed Project relation is not an owned top-level block");
+                }
+                let old = &body[a + start.len()..b];
+                if project_link.as_deref() != Some(old.trim()) {
+                    bail!("managed Project relation was edited");
+                }
+                body.replace_range(a..b + end.len(), &block);
+            }
+            _ => bail!("managed Project relation is ambiguous"),
+        }
+        let revision = self.revision.checked_add(1).context("revision overflow")?;
+        let header_end = header.len();
+        let header = replace_revision(&header, revision, header_end)?;
+        Self::parse(self.metadata.common().brain_id, &format!("{header}---{newline}{body}"))
+    }
+
     /// Candidate for explicit review. Preserves all external bytes except the
     /// displayed revision digits, unless the user already advanced them.
     pub fn approval_candidate(&self, accepted_revision: u64) -> Result<Self> {
@@ -266,4 +336,42 @@ pub(crate) fn project_metadata(input: &str) -> Result<DocumentMetadata> {
         bail!("relation target is not Project");
     }
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+    fn document() -> MemoryDocument {
+        let id = Uuid::from_u128(101);
+        let body = format!("## Objective and scope\nObjetivo\n## Current decisions\nDecisión humana\n## Outcome status\nEstado\n## Relevant evidence\n{}\n## Next actions and open questions\nPróximos pasos\n", history_link(id));
+        let doc = create_document(id, "Contexto", &body, None).unwrap();
+        let raw = doc.raw.replace("memory_revision:", "# comentario humano\nunknown_field: conservar\nmemory_revision:").replace('\n', "\r\n");
+        MemoryDocument::parse(id, &raw).unwrap()
+    }
+    fn project(n: u128) -> ProjectAssociation {
+        ProjectAssociation { brain_project: Uuid::from_u128(n), path: format!("01-proyectos/P{n}/Proyecto.md"), label: format!("Proyecto {n}") }
+    }
+    #[test]
+    fn association_preserves_identity_unknown_metadata_and_human_references() {
+        let first = document();
+        let next = first.with_project(&project(1)).unwrap();
+        assert_eq!(next.revision, 2);
+        assert_eq!(next.metadata.common().brain_id, first.metadata.common().brain_id);
+        assert!(next.raw.contains("# comentario humano\r\nunknown_field: conservar\r\n"));
+        assert!(next.body().contains("Decisión humana\r\n"));
+        assert!(next.body().contains(&history_link(first.metadata.common().brain_id)));
+        assert_eq!(next.with_project(&project(1)).unwrap().raw, next.raw);
+        let rebound = next.with_project(&project(2)).unwrap();
+        assert_eq!(rebound.revision, 3);
+        assert_eq!(rebound.body().matches("<!-- brain:principal-project -->").count(), 1);
+        assert!(rebound.body().contains(&project(2).link()));
+        assert!(!rebound.body().contains(&project(1).link()));
+    }
+    #[test]
+    fn literal_managed_marker_is_not_rewritten() {
+        let first = document();
+        let body = first.body().replace("Decisión humana", "```\n<!-- brain:principal-project -->\nEjemplo humano\n<!-- /brain:principal-project -->\n```");
+        let literal = first.successor(&body).unwrap();
+        assert!(literal.with_project(&project(1)).is_err());
+    }
 }
