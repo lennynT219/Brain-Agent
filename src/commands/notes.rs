@@ -36,6 +36,10 @@ struct CreateNote {
     project_id: Uuid,
     title: String,
     body: String,
+    // Hosts send true to fail closed with older binaries that reject the
+    // unknown field. Omission stays compatible for existing clients.
+    #[serde(default)]
+    require_named_link: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -79,7 +83,11 @@ fn dispatch(request: Request) -> Result<Value, Failure> {
                 project_id,
                 title,
                 body,
+                require_named_link,
             } = arguments(request.arguments)?;
+            if require_named_link == Some(false) {
+                return Err(Failure("invalid", "Notes are always created with a title filename and Project link"));
+            }
             notes::validate_id(project_id)?;
             Scope::load()?.create(project_id, title, &body)
         }

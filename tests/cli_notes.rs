@@ -273,17 +273,46 @@ fn requires_write_permission_and_project_id_and_rejects_stale_bytes() {
     lock.try_lock().unwrap();
     assert_eq!(f.create("Bloqueada", "")["status"], "busy");
     drop(lock);
-    let created = f.create("Título: «nota»", "# Cuerpo\n\n[[Referente]]\n");
+    let body = "# Cuerpo\r\n\r\n[[Referente]]\r\n";
+    let created = f.call("create", json!({"project_id": PROJECT, "title":"Título de la nota", "body":body,
+        "require_named_link": true}));
     assert_eq!(created["status"], "created");
     let new_id = created["note_id"].as_str().unwrap();
     assert!(!Uuid::parse_str(new_id).unwrap().is_nil());
-    assert!(f.notes.join(format!("{new_id}.md")).is_file());
-    assert_eq!(f.read(new_id)["body"], "# Cuerpo\n\n[[Referente]]\n");
-    assert_eq!(f.read(new_id)["title"], "Título: «nota»");
+    let new_path = f.notes.join("Título de la nota.md");
+    let raw = fs::read_to_string(&new_path).unwrap();
+    assert!(!f.notes.join(format!("{new_id}.md")).exists());
+    let prefix = raw.strip_suffix(body).unwrap();
+    assert!(prefix.contains("\nproject_link: \"[[01-proyectos/A/Proyecto]]\"\n---\n"));
+    let found = f.read(new_id);
+    assert_eq!(found["body"], body);
+    assert_eq!(found["title"], "Título de la nota");
+    assert_eq!(found["markdown"], raw);
+    assert_eq!(f.update(new_id, &found["markdown"], "Cambió el cuerpo\n")["status"], "updated");
+    assert_eq!(fs::read_to_string(new_path).unwrap(), format!("{prefix}Cambió el cuerpo\n"));
     assert_eq!(
         f.call("list", json!({}))["notes"].as_array().unwrap().len(),
         2
     );
+}
+
+#[test]
+fn named_creation_rejects_invalid_titles_and_collisions_without_replacing_notes() {
+    let f = Fixture::new();
+    f.bind(Some(true));
+    for title in ["Título: no", "../ruta", "LPT¹", "CON .variante", ".oculta", "Nombre.", " Nombre", "Nombre ", &"á".repeat(127)] {
+        assert_eq!(f.create(title, "body")["status"], "invalid", "{title}");
+    }
+    assert!(!f.notes.join(LOCK).exists());
+    let legacy_file = f.notes.join("Original.md");
+    let legacy = fs::read(&legacy_file).unwrap();
+    assert_eq!(f.create("TÍTULO", "duplicate legacy title")["status"], "conflict");
+    let unmanaged = f.notes.join("Naming conventions.md");
+    fs::write(&unmanaged, "# Contenido no gestionado\n").unwrap();
+    assert_eq!(f.create("Naming conventions", "avoid replacement")["status"], "conflict");
+    assert_eq!(fs::read(&legacy_file).unwrap(), legacy);
+    assert_eq!(fs::read_to_string(unmanaged).unwrap(), "# Contenido no gestionado\n");
+    assert_eq!(f.call("list", json!({}))["notes"].as_array().unwrap().len(), 1);
 }
 
 #[test]

@@ -43,6 +43,24 @@ fn valid_title(title: &str) -> bool {
     !title.trim().is_empty() && title.len() <= MAX_TITLE && !title.chars().any(char::is_control)
 }
 
+// Creation only: a legacy note is still addressed by brain_id, even if its
+// preexisting filename or title would not meet the new naming rules.
+fn named_filename(title: &str) -> Result<String> {
+    let filename = format!("{title}.md");
+    if !valid_title(title)
+        || title.trim() != title
+        || title.starts_with('.') // Obsidian ignores dotfiles.
+        || title.ends_with('.')
+        || filename.len() > 255
+        || filename.encode_utf16().count() > 255
+        || !crate::project_binding::safe_component(&filename)
+        || crate::project_binding::reserved_windows_stem(title)
+    {
+        return Err(Failure("invalid", "Note title must form a portable Markdown filename"));
+    }
+    Ok(filename)
+}
+
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Binding {
@@ -345,24 +363,24 @@ impl Scope {
     }
 
     pub(crate) fn create(&self, project_id: Uuid, title: String, body: &str) -> Result<Value> {
-        if !valid_title(&title) {
-            return Err(Failure(
-                "invalid",
-                "title must be nonblank, at most 256 UTF-8 bytes and without control characters",
-            ));
-        }
+        let filename = named_filename(&title)?;
         let _lock = self.lock_for_write(project_id)?;
         // Avoid making a 256-entry directory unreadable by creating entry 257.
         let note_id = Uuid::new_v4();
-        let mut occupied = false;
-        if self.notes(|note| occupied |= note.metadata.brain_id == note_id)? >= MAX_ENTRIES {
+        let mut id_taken = false;
+        let mut title_taken = false;
+        let folded_title = title.to_lowercase();
+        if self.notes(|note| {
+            id_taken |= note.metadata.brain_id == note_id;
+            title_taken |= note.metadata.title.to_lowercase() == folded_title;
+        })? >= MAX_ENTRIES {
             return Err(unavailable("Notes directory has reached the entry limit"));
         }
-        if occupied {
-            return Err(Failure(
-                "conflict",
-                "generated Note identity is already used",
-            ));
+        if id_taken {
+            return Err(Failure("conflict", "generated Note identity is already used"));
+        }
+        if title_taken {
+            return Err(Failure("conflict", "a Note already uses this title in the Project"));
         }
         let metadata = DocumentMetadata::Note(CommonMetadata {
             brain_version: DOCUMENT_VERSION,
@@ -371,7 +389,14 @@ impl Scope {
         });
         let yaml = serde_saphyr::to_string(&metadata)
             .map_err(|_| Failure("invalid", "cannot encode Note metadata"))?;
-        let markdown = format!("---\n{}\n---\n{body}", yaml.trim_end_matches('\n'));
+        // Scope already validated the exact Project path. A vault-relative
+        // wikilink disambiguates projects with the same filename. Keep it in a
+        // quoted property so the author-supplied body stays byte-for-byte intact.
+        let target = self.binding.project_path.strip_suffix(".md")
+            .ok_or_else(|| unavailable("invalid Project link target"))?;
+        let project_link = serde_json::to_string(&format!("[[{target}]]"))
+            .map_err(|_| Failure("invalid", "cannot encode Project link"))?;
+        let markdown = format!("---\n{}\nproject_link: {project_link}\n---\n{body}", yaml.trim_end_matches('\n'));
         // Do not publish a title that the Markdown codec cannot round-trip.
         if !matches!(self::metadata(&markdown, "note"), Ok(Some((decoded, _))) if decoded == metadata)
         {
@@ -380,10 +405,10 @@ impl Scope {
         let staged = self.stage(&markdown, None)?;
         self.recheck()?;
         staged
-            .persist_noclobber(self.notes.join(format!("{note_id}.md")))
+            .persist_noclobber(self.notes.join(filename))
             .map_err(|e| {
                 if e.error.kind() == io::ErrorKind::AlreadyExists {
-                    Failure("conflict", "generated Note file already exists")
+                    Failure("conflict", "Note filename already exists")
                 } else {
                     unavailable("cannot publish new Note")
                 }

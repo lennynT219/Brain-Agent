@@ -64,7 +64,7 @@ rechazan.
 |---|---|---|
 | `list` | `{project_id?:UUID}` | `status: "listed"`, `project_id`, `notes: [{note_id, title}]` |
 | `read` | `{note_id, project_id?:UUID}` | `status: "found"`, `project_id`, `note_id`, `title`, `markdown`, `body` |
-| `create` | `{project_id, title, body}` | `status: "created"`, `project_id`, `note_id`, `title` |
+| `create` | `{project_id, title, body, require_named_link?:true}` | `status: "created"`, `project_id`, `note_id`, `title` |
 | `update` | `{project_id, note_id, expected_markdown, body}` | `status: "updated"` o `"unchanged"`, `project_id`, `note_id`, `title` |
 
 - En `list/read`, un `project_id` explícito permite una fuente adicional activa
@@ -77,8 +77,22 @@ rechazan.
 - En escrituras, el host envía el `project_id` observado de su contexto.
   Debe invalidar contexto y bases cuando cambia de perfil, vault o vinculación.
   Brain comprueba la coincidencia del Project, no solo la existencia de la nota.
-- `create` genera un UUID y un nombre de archivo nuevos; nunca sustituye un
-  archivo existente. `body` no incluye el frontmatter que administra Brain.
+- `create` conserva el UUID como identidad interna (`brain_id`), pero publica
+  el archivo `<título>.md` en `notas/` con el título exacto (sin sustituir
+  caracteres ni normalizar Unicode). Brain genera la propiedad `project_link`
+  como wikilink entrecomillado a la ruta de la ficha del Project principal
+  dentro del vault, por ejemplo `project_link: "[[01-proyectos/A/Proyecto]]"`.
+  La propiedad sirve de enlace en Obsidian; no concede acceso ni altera el
+  cuerpo que devuelve `read`. La autorización sigue naciendo del vínculo.
+- El host puede exigir esa forma de publicación con `require_named_link: true`.
+  Un Brain antiguo rechaza el campo desconocido antes de escribir: no hay
+  fallback. Los clientes que omiten el campo todavía crean notas con el
+  nombre y enlace nuevos usando un Brain compatible.
+- Un título ya usado por una nota del Project (comparado en minúsculas) o un
+  destino ocupado devuelve `conflict`: nunca se cambia de nombre ni se
+  sustituye un archivo. Las notas existentes, incluidas `<UUID>.md` sin
+  enlace, se siguen leyendo y actualizando por ID sin migración automática.
+  `body` no incluye el frontmatter que administra Brain.
 - `update` exige coincidencia exacta de `expected_markdown` y solo sustituye
   `body`. Deja intacto el frontmatter (incluidos comentarios y campos ajenos).
   Si el delimitador final estaba en EOF sin salto de línea y se añade contenido,
@@ -92,8 +106,11 @@ rechazan.
 Entrada y salida: 4 MiB (incluido el salto de línea de respuesta). Cada archivo
 Markdown candidato: 512 KiB; cada directorio inspeccionado: 256 entradas directas
 (excluyendo el archivo reservado `.brain-notes.lock`). El marcador admite 8 KiB.
-Los títulos de Note no pueden estar en blanco, contener caracteres de control ni
-exceder 256 bytes UTF-8. No hay truncamiento ni paginación.
+Los títulos existentes de Note no pueden estar en blanco, contener caracteres de
+control ni exceder 256 bytes UTF-8. En creación, `<título>.md` debe caber en
+255 bytes UTF-8 y 255 unidades UTF-16, y se rechazan los títulos con separadores,
+caracteres no portables, espacios en los extremos, punto inicial o final y
+nombres de dispositivo reservados de Windows. No hay truncamiento ni paginación.
 
 Los errores tienen `result: {status, message}` con uno de `invalid`,
 `unsupported`, `unbound`, `unavailable`, `denied`, `not_found`, `conflict`,
