@@ -3,12 +3,14 @@
 use super::{
     CURRENT_SECTIONS,
     binding::{self, Binding, Resolution},
+    change_log::{self, HEAD},
     history::{AcceptedSnapshot, History},
     history_link,
     markdown::{self, MemoryDocument, ProjectAssociation},
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -52,7 +54,10 @@ fn io(error: std::io::Error) -> Failure {
 fn invalid(error: impl Into<anyhow::Error>) -> Failure {
     let error = error.into();
     let mut failure = fail("invalid", "document or arguments failed validation");
-    if error.downcast_ref::<super::syntax::UnclosedHtml>().is_some() {
+    if error
+        .downcast_ref::<super::syntax::UnclosedHtml>()
+        .is_some()
+    {
         failure.reason = Some("UNCLOSED_HTML".into());
     }
     failure
@@ -144,6 +149,8 @@ pub struct Observation {
     pub history_bytes: Option<Vec<u8>>,
     #[serde(default)]
     pub history_corrupt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_head: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +162,10 @@ struct Pending {
     before_history: Option<String>,
     next_current: String,
     next_history: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_head: Option<String>,
     marker: Option<String>,
     #[serde(default)]
     before_marker: Option<String>,
@@ -167,6 +178,24 @@ struct Reservation {
     request_id: Uuid,
     #[serde(default)]
     before_marker: Option<String>,
+}
+impl Reservation {
+    fn parse(raw: &str) -> Result<Self> {
+        let r: Self =
+            toml::from_str(raw).map_err(|_| fail("partial", "invalid creation reservation"))?;
+        if r.version != 1 || r.memory_id.is_nil() || r.request_id.is_nil() {
+            return Err(fail("partial", "invalid creation reservation identity"));
+        }
+        Ok(r)
+    }
+    fn from_pending(p: &Pending) -> Self {
+        Self {
+            version: 1,
+            memory_id: p.memory_id,
+            request_id: p.request_id,
+            before_marker: p.before_marker.clone(),
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -190,6 +219,7 @@ pub enum Fault {
     AfterPending,
     AfterCurrent,
     AfterHistory,
+    AfterHead,
     BeforeMarker,
     AfterMarker,
     AfterReservationCleanup,
@@ -331,6 +361,7 @@ impl Store {
             ));
         }
         let current = read_optional(&dir.join("Memoria.md"))?;
+        let head = read_optional(&dir.join(HEAD))?;
         let history = match read_optional(&dir.join("Historial.md")) {
             Ok(history) => history,
             Err(error) if error.reason.as_deref() == Some("history_corrupt") => {
@@ -344,7 +375,7 @@ impl Store {
         let Some(current) = current else {
             return Ok(state(
                 id,
-                if history.is_none() {
+                if history.is_none() && head.is_none() {
                     "not_found"
                 } else {
                     "partial"
@@ -355,9 +386,37 @@ impl Store {
         let Some(history) = history else {
             return Ok(State {
                 observed_markdown: Some(current),
-                ..state(id, "partial", "history_missing")
+                ..state(
+                    id,
+                    "partial",
+                    if head.is_none() {
+                        "history_missing"
+                    } else {
+                        "log_baseline_incomplete"
+                    },
+                )
             });
         };
+        if change_log::is_log(&history) {
+            return Ok(
+                match head
+                    .as_deref()
+                    .and_then(|head| change_log::baseline(id, &history, head).ok())
+                {
+                    Some(doc) => state_from_baseline(id, current, doc.revision, doc.raw),
+                    None => State {
+                        observed_markdown: Some(current),
+                        ..state(id, "partial", "log_baseline_incomplete")
+                    },
+                },
+            );
+        }
+        if head.is_some() {
+            return Ok(State {
+                observed_markdown: Some(current),
+                ..state(id, "partial", "log_baseline_incomplete")
+            });
+        }
         let history = match History::parse(id, &history) {
             Ok(history) => history,
             Err(_) => {
@@ -381,27 +440,29 @@ impl Store {
             }
         }
         let last = history.latest().expect("parser requires baseline");
-        let mut result = State {
-            status: "found".into(),
-            memory_id: id,
-            revision: Some(last.revision),
-            accepted_markdown: Some(last.markdown.clone()),
-            observed_markdown: None,
-            approval_candidate: None,
-            reason: None,
-        };
-        if current != last.markdown {
-            result.status = "manual_review".into();
-            result.approval_candidate = MemoryDocument::parse(id, &current)
-                .and_then(|doc| doc.approval_candidate(last.revision))
-                .ok()
-                .map(|doc| doc.raw);
-            result.observed_markdown = Some(current);
-        }
-        Ok(result)
+        Ok(state_from_baseline(
+            id,
+            current,
+            last.revision,
+            last.markdown.clone(),
+        ))
     }
 
     pub fn create(&self, request: Uuid, args: Create) -> Result<Saved> {
+        self.create_with_history(request, args, None)
+    }
+
+    pub fn create_log(&self, request: Uuid, args: Create, summary: &str) -> Result<Saved> {
+        change_log::validate_summary(summary).map_err(invalid)?;
+        self.create_with_history(request, args, Some(summary))
+    }
+
+    fn create_with_history(
+        &self,
+        request: Uuid,
+        args: Create,
+        summary: Option<&str>,
+    ) -> Result<Saved> {
         request_id(request)?;
         if let Some((_, reservation)) = pending_context(&args.context)? {
             let mut failure = fail("partial", "unfinished creation; inspect, do not retry");
@@ -451,7 +512,7 @@ impl Store {
             }
             _ => {}
         }
-        self.create_target(request, args, &target, None)
+        self.create_target(request, args, &target, None, summary)
     }
 
     /// New identity for exactly one approved existing marker whose old UUID
@@ -485,6 +546,7 @@ impl Store {
             },
             &target,
             Some(args.expected_marker),
+            None,
         )
     }
 
@@ -518,6 +580,7 @@ impl Store {
         args: Create,
         target: &Path,
         before_marker: Option<String>,
+        summary: Option<&str>,
     ) -> Result<Saved> {
         if let Some(project) = &args.project {
             self.validate_project(project)?;
@@ -567,6 +630,14 @@ impl Store {
                 ));
             }
         }
+        let (next_history, next_head) = if let Some(summary) = summary {
+            (
+                change_log::append(id, None, 1, request, summary).map_err(invalid)?,
+                Some(change_log::encode_head(id, request, &next).map_err(invalid)?),
+            )
+        } else {
+            (single_history(id, request, 1, &next.raw)?, None)
+        };
         let reservation = Reservation {
             version: 1,
             memory_id: id,
@@ -585,6 +656,7 @@ impl Store {
             if read_optional(&dir.join("Memoria.md"))?.is_some()
                 || read_optional(&dir.join(PENDING))?.is_some()
                 || read_optional(&dir.join("Historial.md"))?.is_some()
+                || read_optional(&dir.join(HEAD))?.is_some()
             {
                 return Err(fail(
                     "conflict",
@@ -594,13 +666,15 @@ impl Store {
             self.commit(
                 &dir,
                 Pending {
-                    version: 1,
+                    version: if next_head.is_some() { 2 } else { 1 },
                     memory_id: id,
                     request_id: request,
                     before_current: None,
                     before_history: None,
-                    next_current: next.raw.clone(),
-                    next_history: single_history(id, request, 1, &next.raw)?,
+                    next_current: next.raw,
+                    next_history,
+                    before_head: None,
+                    next_head,
                     marker: Some(marker),
                     before_marker,
                 },
@@ -618,11 +692,47 @@ impl Store {
     }
 
     pub fn update(&self, id: Uuid, request: Uuid, expected: Expected, body: &str) -> Result<Saved> {
+        self.update_body(
+            id,
+            request,
+            expected,
+            |_| Ok(body.to_owned()),
+            "Se actualizó el estado de trabajo.",
+        )
+    }
+
+    pub fn update_sections(
+        &self,
+        id: Uuid,
+        request: Uuid,
+        expected: Expected,
+        changes: &BTreeMap<String, String>,
+        summary: &str,
+    ) -> Result<Saved> {
+        change_log::validate_summary(summary).map_err(invalid)?;
+        self.update_body(
+            id,
+            request,
+            expected,
+            |document| document.with_sections(changes).map_err(invalid),
+            summary,
+        )
+    }
+
+    fn update_body(
+        &self,
+        id: Uuid,
+        request: Uuid,
+        expected: Expected,
+        successor: impl FnOnce(&MemoryDocument) -> Result<String>,
+        summary: &str,
+    ) -> Result<Saved> {
         request_id(request)?;
         let (dir, _lock) = self.lock(id, false)?;
         let state = self.check_expected(id, &dir, &expected, false)?;
         let before = state.accepted_markdown.expect("checked baseline");
         let document = MemoryDocument::parse(id, &before).map_err(invalid)?;
+        let body = successor(&document)?;
         if document.body() == body {
             return Ok(Saved {
                 status: "unchanged".into(),
@@ -632,8 +742,8 @@ impl Store {
                 replaced_memory_id: None,
             });
         }
-        let next = document.successor(body).map_err(invalid)?;
-        self.successor(&dir, id, request, before, next)
+        let next = document.successor(&body).map_err(invalid)?;
+        self.successor(&dir, request, &before, &before, next, Some(summary))
     }
 
     pub fn accept_external(
@@ -661,16 +771,15 @@ impl Store {
             ));
         }
         let next = MemoryDocument::parse(id, approved_markdown).map_err(invalid)?;
-        // An explicitly reviewed Project association is validated separately.
-        if let crate::document::DocumentMetadata::Memory {
-            brain_project: Some(project_id),
-            project_link: Some(link),
-            ..
-        } = &next.metadata
-        {
-            self.validate_project_link(*project_id, link)?;
-        }
-        self.successor(&dir, id, request, observed.into(), next)
+        self.validate_association(&next)?;
+        self.successor(
+            &dir,
+            request,
+            observed,
+            &expected.accepted_markdown,
+            next,
+            None,
+        )
     }
 
     fn check_expected(
@@ -702,33 +811,75 @@ impl Store {
     fn successor(
         &self,
         dir: &Path,
-        id: Uuid,
         request: Uuid,
-        before_current: String,
+        before_current: &str,
+        accepted: &str,
         next: MemoryDocument,
+        summary: Option<&str>,
     ) -> Result<Saved> {
+        let id = next.metadata.common().brain_id;
         let history = read_optional(&dir.join("Historial.md"))?
             .ok_or_else(|| fail("partial", "history missing"))?;
-        let mut parsed =
-            History::parse(id, &history).map_err(|_| fail("partial", "history corrupt"))?;
-        parsed
-            .push(AcceptedSnapshot {
-                revision: next.revision,
-                request_id: request,
-                markdown: next.raw.clone(),
-            })
-            .map_err(|_| fail("conflict", "revision/request already accepted"))?;
-        let next_history = parsed.encode().map_err(invalid)?;
+        let head = read_optional(&dir.join(HEAD))?;
+        let (next_history, next_head) = if change_log::is_log(&history) {
+            let baseline = head
+                .as_deref()
+                .and_then(|head| change_log::baseline(id, &history, head).ok())
+                .ok_or_else(|| fail("partial", "log baseline incomplete"))?;
+            if baseline.raw != accepted {
+                return Err(fail("conflict", "accepted baseline changed"));
+            }
+            let manual_summary;
+            let summary = match summary {
+                Some(summary) => summary,
+                None => {
+                    let parts = baseline.changed_parts(&next).map_err(invalid)?;
+                    manual_summary = if parts.is_empty() {
+                        "Se confirmó manualmente la memoria sin cambios de contenido.".into()
+                    } else {
+                        format!(
+                            "Se aceptaron cambios manuales en {} tras revisión explícita.",
+                            parts.join(", ")
+                        )
+                    };
+                    &manual_summary
+                }
+            };
+            (
+                change_log::append(id, Some(&history), next.revision, request, summary)
+                    .map_err(invalid)?,
+                Some(change_log::encode_head(id, request, &next).map_err(invalid)?),
+            )
+        } else {
+            if head.is_some() {
+                return Err(fail("partial", "unexpected accepted head"));
+            }
+            let mut parsed =
+                History::parse(id, &history).map_err(|_| fail("partial", "history corrupt"))?;
+            if parsed.latest().is_none_or(|last| last.markdown != accepted) {
+                return Err(fail("conflict", "accepted baseline changed"));
+            }
+            parsed
+                .push(AcceptedSnapshot {
+                    revision: next.revision,
+                    request_id: request,
+                    markdown: next.raw.clone(),
+                })
+                .map_err(|_| fail("conflict", "revision/request already accepted"))?;
+            (parsed.encode().map_err(invalid)?, None)
+        };
         self.commit(
             dir,
             Pending {
-                version: 1,
+                version: if next_head.is_some() { 2 } else { 1 },
                 memory_id: id,
                 request_id: request,
-                before_current: Some(before_current),
+                before_current: Some(before_current.into()),
                 before_history: Some(history),
                 next_current: next.raw,
                 next_history,
+                before_head: head,
+                next_head,
                 marker: None,
                 before_marker: None,
             },
@@ -741,6 +892,7 @@ impl Store {
         // cooperating writers; an arbitrary editor can still race this check.
         if read_optional(&dir.join("Memoria.md"))? != pending.before_current
             || read_optional(&dir.join("Historial.md"))? != pending.before_history
+            || read_optional(&dir.join(HEAD))? != pending.before_head
         {
             return Err(fail(
                 "conflict",
@@ -761,6 +913,13 @@ impl Store {
     fn finish(&self, dir: &Path, pending: &Pending, target: Option<&Path>) -> Result<Saved> {
         let current = read_optional(&dir.join("Memoria.md"))?;
         let history = read_optional(&dir.join("Historial.md"))?;
+        let head = read_optional(&dir.join(HEAD))?;
+        if head != pending.next_head && head != pending.before_head {
+            return Err(fail(
+                "conflict",
+                "accepted head changed outside pending operation",
+            ));
+        }
         if current.as_ref() != Some(&pending.next_current) && current != pending.before_current {
             return Err(fail(
                 "conflict",
@@ -789,6 +948,12 @@ impl Store {
             )?;
         }
         self.hit(Fault::AfterHistory, pending.memory_id)?;
+        if let Some(next_head) = &pending.next_head {
+            if head.as_ref() != Some(next_head) {
+                publish(&dir.join(HEAD), next_head, head.is_some())?;
+            }
+            self.hit(Fault::AfterHead, pending.memory_id)?;
+        }
         if let Some(marker) = &pending.marker {
             let target = target.ok_or_else(|| {
                 fail(
@@ -800,12 +965,7 @@ impl Store {
             let existing = read_optional(&path)?;
             let reservation_path = target.join(RESERVATION);
             if let Some(raw) = read_optional(&reservation_path)? {
-                let expected = Reservation {
-                    version: 1,
-                    memory_id: pending.memory_id,
-                    request_id: pending.request_id,
-                    before_marker: pending.before_marker.clone(),
-                };
+                let expected = Reservation::from_pending(pending);
                 if raw != toml::to_string(&expected).map_err(invalid)? {
                     return Err(fail("conflict", "creation reservation bytes changed"));
                 }
@@ -860,6 +1020,7 @@ impl Store {
         }
         if read_optional(&dir.join("Memoria.md"))?.as_ref() != Some(&pending.next_current)
             || read_optional(&dir.join("Historial.md"))?.as_ref() != Some(&pending.next_history)
+            || read_optional(&dir.join(HEAD))? != pending.next_head
         {
             return Err(fail("conflict", "publication changed during verification"));
         }
@@ -874,12 +1035,7 @@ impl Store {
             }
             let reservation = target.expect("checked").join(RESERVATION);
             if let Some(raw) = read_optional(&reservation)? {
-                let expected = Reservation {
-                    version: 1,
-                    memory_id: pending.memory_id,
-                    request_id: pending.request_id,
-                    before_marker: pending.before_marker.clone(),
-                };
+                let expected = Reservation::from_pending(pending);
                 if raw != toml::to_string(&expected).map_err(invalid)? {
                     return Err(fail("conflict", "reservation changed before cleanup"));
                 }
@@ -905,6 +1061,8 @@ impl Store {
         })
     }
 
+    // Only a first creation at the working directory, without an intent or
+    // any vault entries, can be abandoned. Never handle replacement here.
     pub fn inspect_recovery(&self, id: Uuid, context: Option<&Context>) -> Result<Observation> {
         let dir = self.directory(id, false);
         let (directory, _lock) = match dir {
@@ -955,6 +1113,10 @@ impl Store {
                 .flatten(),
             history_bytes,
             history_corrupt,
+            accepted_head: dir
+                .map(|d| read_optional(&d.join(HEAD)))
+                .transpose()?
+                .flatten(),
         })
     }
 
@@ -1000,12 +1162,8 @@ impl Store {
         self.validate_pending(id, &pending)?;
         if pending.marker.is_some() {
             if let Some(raw_reservation) = observed.reservation.as_deref() {
-                let reservation: Reservation = toml::from_str(raw_reservation).map_err(invalid)?;
-                if reservation.memory_id != id
-                    || reservation.request_id != pending.request_id
-                    || reservation.version != 1
-                    || reservation.before_marker != pending.before_marker
-                {
+                let reservation = Reservation::parse(raw_reservation)?;
+                if reservation != Reservation::from_pending(&pending) {
                     return Err(fail("conflict", "creation reservation mismatch"));
                 }
             } else if observed.marker != pending.marker {
@@ -1025,8 +1183,13 @@ impl Store {
             })
     }
     fn validate_pending(&self, id: Uuid, p: &Pending) -> Result<()> {
-        if p.version != 1 || p.memory_id != id || p.request_id.is_nil() {
-            return Err(fail("partial", "invalid pending identity/version"));
+        if p.memory_id != id || p.request_id.is_nil() {
+            return Err(fail("partial", "invalid pending identity"));
+        }
+        match (p.version, &p.next_head, &p.before_head) {
+            (2, Some(_), _) => return self.validate_log_pending(id, p),
+            (1, None, None) => {}
+            _ => return Err(fail("partial", "invalid pending version/artifacts")),
         }
         if !matches!(
             (&p.before_current, &p.before_history, &p.marker),
@@ -1098,6 +1261,65 @@ impl Store {
         }
         Ok(())
     }
+    fn validate_log_pending(&self, id: Uuid, p: &Pending) -> Result<()> {
+        let bad = || fail("partial", "invalid change-log publication intent");
+        let log = change_log::entries(id, &p.next_history).map_err(|_| bad())?;
+        let tip = log.last().ok_or_else(bad)?;
+        let next =
+            change_log::baseline(id, &p.next_history, p.next_head.as_deref().ok_or_else(bad)?)
+                .map_err(|_| bad())?;
+        if tip.request != p.request_id || next.raw != p.next_current {
+            return Err(bad());
+        }
+        self.validate_association(&next)?;
+        match (
+            &p.before_current,
+            &p.before_history,
+            &p.before_head,
+            &p.marker,
+        ) {
+            (None, None, None, Some(marker)) if p.before_marker.is_none() => {
+                if log.len() != 1
+                    || tip.revision != 1
+                    || Binding::parse(marker).map_err(invalid)?.memory_id != id
+                {
+                    return Err(bad());
+                }
+            }
+            (Some(before), Some(old_log), Some(old_head), None) if p.before_marker.is_none() => {
+                let old = change_log::baseline(id, old_log, old_head).map_err(|_| bad())?;
+                let count = change_log::entries(id, old_log).map_err(|_| bad())?.len();
+                if !p.next_history.starts_with(old_log)
+                    || log.len() != count + 1
+                    || old.revision.checked_add(1) != Some(next.revision)
+                {
+                    return Err(bad());
+                }
+                if before != &old.raw
+                    && MemoryDocument::parse(id, before)
+                        .and_then(|doc| doc.approval_candidate(old.revision))
+                        .map_or(true, |candidate| candidate.raw != next.raw)
+                {
+                    return Err(bad());
+                }
+            }
+            _ => return Err(bad()),
+        }
+        Ok(())
+    }
+
+    fn validate_association(&self, document: &MemoryDocument) -> Result<()> {
+        if let crate::document::DocumentMetadata::Memory {
+            brain_project: Some(id),
+            project_link: Some(link),
+            ..
+        } = &document.metadata
+        {
+            self.validate_project_link(*id, link)?;
+        }
+        Ok(())
+    }
+
     fn validate_project(&self, p: &ProjectAssociation) -> Result<()> {
         let path = relative_project(&self.vault, &p.path)?;
         let raw =
@@ -1121,6 +1343,27 @@ impl Store {
             path: format!("{}.md", path.strip_suffix(".md").unwrap_or(path)),
             label: label.into(),
         })
+    }
+}
+
+fn state_from_baseline(id: Uuid, current: String, revision: u64, accepted: String) -> State {
+    let changed = current != accepted;
+    let approval_candidate = changed
+        .then(|| {
+            MemoryDocument::parse(id, &current)
+                .and_then(|doc| doc.approval_candidate(revision))
+                .ok()
+                .map(|doc| doc.raw)
+        })
+        .flatten();
+    State {
+        status: if changed { "manual_review" } else { "found" }.into(),
+        memory_id: id,
+        revision: Some(revision),
+        accepted_markdown: Some(accepted),
+        observed_markdown: changed.then_some(current),
+        approval_candidate,
+        reason: None,
     }
 }
 
@@ -1200,14 +1443,20 @@ fn observed_history(id: Uuid, path: &Path) -> Result<(Option<String>, Option<Vec
     };
     match String::from_utf8(raw) {
         Ok(text) => {
-            let valid = History::parse(id, &text)
-                .map(|history| {
-                    history.snapshots.iter().all(|snapshot| {
-                        MemoryDocument::parse(id, &snapshot.markdown)
-                            .is_ok_and(|doc| doc.revision == snapshot.revision)
+            let valid = if change_log::is_log(&text) {
+                // A pending intent may legitimately have published the log but
+                // not yet its head. Recovery observes both exact artifacts.
+                change_log::entries(id, &text).is_ok()
+            } else {
+                History::parse(id, &text)
+                    .map(|history| {
+                        history.snapshots.iter().all(|snapshot| {
+                            MemoryDocument::parse(id, &snapshot.markdown)
+                                .is_ok_and(|doc| doc.revision == snapshot.revision)
+                        })
                     })
-                })
-                .unwrap_or(false);
+                    .unwrap_or(false)
+            };
             Ok((Some(text), None, !valid))
         }
         Err(error) => Ok((None, Some(error.into_bytes()), true)),
@@ -1253,15 +1502,7 @@ fn pending_context(context: &Context) -> Result<Option<(PathBuf, Reservation)>> 
     let mut dir = context.working_directory.canonicalize().map_err(io)?;
     loop {
         if let Some(raw) = read_optional(&dir.join(RESERVATION))? {
-            let reservation: Reservation = toml::from_str(&raw)
-                .map_err(|_| fail("partial", "invalid creation reservation"))?;
-            if reservation.version != 1
-                || reservation.memory_id.is_nil()
-                || reservation.request_id.is_nil()
-            {
-                return Err(fail("partial", "invalid creation reservation identity"));
-            }
-            return Ok(Some((dir, reservation)));
+            return Ok(Some((dir, Reservation::parse(&raw)?)));
         }
         // A closer own marker masks any farther context/reservation.
         if read_optional(&dir.join(binding::MARKER_NAME))?.is_some() || dir == boundary {

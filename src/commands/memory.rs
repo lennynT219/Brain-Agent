@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Write},
     path::PathBuf,
 };
@@ -34,6 +35,14 @@ struct Update {
     memory_id: Uuid,
     expected: Expected,
     body: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SectionUpdate {
+    memory_id: Uuid,
+    expected: Expected,
+    changes: BTreeMap<String, String>,
+    summary: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,7 +100,7 @@ fn dispatch(request: Request, max_input: u64, max_output: u64) -> Value {
         if args::<Empty>(request.arguments).is_err() {
             return json!({"status":"invalid","message":"capabilities takes empty arguments"});
         }
-        return json!({"status":"found","protocol_version":1,"brain_version":env!("CARGO_PKG_VERSION"),"operations":["capabilities","resolve","read","create","replace_missing","update","accept_external","inspect_recovery","recover"],"max_input_bytes":max_input,"max_output_bytes":max_output,"history_version":1,"document_version":1,"lock":"std_try_lock","authority":"trusted_local_caller","cancellation":"host_terminates_process; mutation_confirmation_may_be_lost"});
+        return json!({"status":"found","protocol_version":1,"brain_version":env!("CARGO_PKG_VERSION"),"operations":["capabilities","resolve","read","create","replace_missing","update","accept_external","inspect_recovery","recover","update_sections"],"max_input_bytes":max_input,"max_output_bytes":max_output,"history_version":2,"document_version":1,"lock":"std_try_lock","authority":"trusted_local_caller","cancellation":"host_terminates_process; mutation_confirmation_may_be_lost"});
     }
     if !matches!(
         request.operation.as_str(),
@@ -103,6 +112,7 @@ fn dispatch(request: Request, max_input: u64, max_output: u64) -> Value {
             | "accept_external"
             | "inspect_recovery"
             | "recover"
+            | "update_sections"
     ) {
         return json!({"status":"unsupported","message":"unknown operation"});
     }
@@ -124,7 +134,17 @@ fn dispatch(request: Request, max_input: u64, max_output: u64) -> Value {
     match request.operation.as_str() {
         "resolve" => value(args::<Context>(arguments).and_then(|args| store.resolve(&args))),
         "read" => value(args::<Identity>(arguments).and_then(|args| store.read(args.memory_id))),
-        "create" => value(args::<Create>(arguments).and_then(|args| store.create(id, args))),
+        "create" => {
+            let mut arguments = arguments;
+            let summary = arguments
+                .as_object_mut()
+                .and_then(|args| args.remove("summary"));
+            value(args::<Create>(arguments).and_then(|args| match summary {
+                Some(Value::String(summary)) => store.create_log(id, args, &summary),
+                None => store.create(id, args),
+                Some(_) => Err(failure("invalid", "invalid history summary")),
+            }))
+        }
         "replace_missing" => value(
             args::<ReplaceMissing>(arguments).and_then(|args| store.replace_missing(id, args)),
         ),
@@ -132,6 +152,15 @@ fn dispatch(request: Request, max_input: u64, max_output: u64) -> Value {
             args::<Update>(arguments)
                 .and_then(|args| store.update(args.memory_id, id, args.expected, &args.body)),
         ),
+        "update_sections" => value(args::<SectionUpdate>(arguments).and_then(|args| {
+            store.update_sections(
+                args.memory_id,
+                id,
+                args.expected,
+                &args.changes,
+                &args.summary,
+            )
+        })),
         "accept_external" => value(args::<Approval>(arguments).and_then(|args| {
             store.accept_external(
                 args.memory_id,

@@ -4,6 +4,7 @@
 //! stored content and returned paths never grant permission. Reads never create.
 
 pub mod binding;
+mod change_log;
 pub mod history;
 pub mod markdown;
 pub mod store;

@@ -18,13 +18,17 @@ impl std::fmt::Display for UnclosedHtml {
 impl std::error::Error for UnclosedHtml {}
 
 pub(crate) fn active_relations(body: &str) -> Result<Vec<String>> {
+    Ok(topology(body)?.0)
+}
+
+pub(super) fn topology(body: &str) -> Result<(Vec<String>, Vec<usize>)> {
     // pulldown's fenced-info handling does not consistently split bare CR.
     // An equal-length view makes CR a logical newline while retaining an exact
     // byte-for-byte source map, including original CRLF and all stored bytes.
     let lines = newline_view(body);
     let view = comment_view(&lines)?;
     let mut stack = Vec::new();
-    let mut headings = 0usize;
+    let mut headings = Vec::new();
     let mut links = Vec::new();
     let mut html: Option<(String, usize)> = None;
     let mut code: Option<(Option<(u8, usize)>, usize)> = None;
@@ -41,12 +45,12 @@ pub(crate) fn active_relations(body: &str) -> Result<Vec<String>> {
                             || matches!(body.as_bytes()[range.start - 1], b'\r' | b'\n');
                         if !at_line_start
                             || CURRENT_SECTIONS
-                                .get(headings)
+                                .get(headings.len())
                                 .is_none_or(|name| line != format!("## {name}"))
                         {
                             bail!("Memory requires exactly five ordered canonical top-level H2s");
                         }
-                        headings += 1;
+                        headings.push(range.start);
                     }
                     Tag::CodeBlock(kind) => {
                         let fence = if matches!(kind, CodeBlockKind::Fenced(_)) {
@@ -129,10 +133,10 @@ pub(crate) fn active_relations(body: &str) -> Result<Vec<String>> {
     if html.is_some() {
         return Err(UnclosedHtml.into());
     }
-    if headings != CURRENT_SECTIONS.len() {
+    if headings.len() != CURRENT_SECTIONS.len() {
         bail!("Memory requires exactly five ordered canonical top-level H2s");
     }
-    Ok(links)
+    Ok((links, headings))
 }
 
 /// Parser-recognized HTML comments are literal through their source-level

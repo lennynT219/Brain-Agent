@@ -75,6 +75,81 @@ impl MemoryDocument {
         &self.raw[self.body_start..]
     }
 
+    /// Apply whole section contents (without their H2s) at validated Markdown
+    /// boundaries. Verify replacements did not hide or introduce a boundary.
+    pub(super) fn with_sections(
+        &self,
+        changes: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        use super::CURRENT_SECTIONS;
+        let body = self.body();
+        if changes.is_empty()
+            || changes
+                .keys()
+                .any(|k| !CURRENT_SECTIONS.contains(&k.as_str()))
+        {
+            bail!("provide one or more named canonical sections");
+        }
+        let (_, starts) = super::syntax::topology(body)?;
+        let mut result = body[..starts[0]].to_owned();
+        let mut expected = Vec::with_capacity(starts.len());
+        for (i, start) in starts.iter().copied().enumerate() {
+            expected.push(result.len());
+            let end = starts.get(i + 1).copied().unwrap_or(body.len());
+            let original = &body[start..end];
+            let Some(change) = changes.get(CURRENT_SECTIONS[i]) else {
+                result.push_str(original);
+                continue;
+            };
+            let line_end = original.find(['\r', '\n']);
+            let (heading, newline) = match line_end {
+                Some(n) if original[n..].starts_with("\r\n") => (&original[..n], "\r\n"),
+                Some(n) => (&original[..n], &original[n..n + 1]),
+                None => (original, "\n"),
+            };
+            if line_end.is_none() && change.is_empty() {
+                result.push_str(original);
+                continue;
+            }
+            result.push_str(heading);
+            result.push_str(newline);
+            result.push_str(change);
+            if i + 1 < starts.len() && !result.ends_with(['\r', '\n']) {
+                result.push_str(newline);
+            }
+        }
+        let (_, actual) = super::syntax::topology(&result)?;
+        if actual != expected {
+            bail!("section replacement changed the canonical heading boundaries");
+        }
+        Ok(result)
+    }
+
+    pub(super) fn changed_parts(&self, next: &Self) -> Result<Vec<&'static str>> {
+        let before = self.body();
+        let after = next.body();
+        let (_, first) = super::syntax::topology(before)?;
+        let (_, second) = super::syntax::topology(after)?;
+        let mut parts = Vec::new();
+        let same_header = replace_revision(
+            &self.raw[..self.body_start],
+            next.revision,
+            self.frontmatter_end,
+        )
+        .is_ok_and(|header| header == next.raw[..next.body_start]);
+        if !same_header || before[..first[0]] != after[..second[0]] {
+            parts.push("metadatos o preámbulo");
+        }
+        for (i, name) in super::CURRENT_SECTIONS.iter().enumerate() {
+            if before[first[i]..first.get(i + 1).copied().unwrap_or(before.len())]
+                != after[second[i]..second.get(i + 1).copied().unwrap_or(after.len())]
+            {
+                parts.push(name);
+            }
+        }
+        Ok(parts)
+    }
+
     /// Normal updates change only body and the digits of an owned revision
     /// scalar. Unsupported YAML spellings fail; they are never normalized.
     pub fn successor(&self, body: &str) -> Result<Self> {

@@ -262,6 +262,34 @@ not permission to truncate. This is neither unlimited storage nor an approved
 future retention policy. History is not authenticated against coordinated edits
 to both history and current or valid edits to older historical content.
 
+## Concise change log (history format 2)
+
+An ordinary `create` request with a one-line `summary` (1–1024 UTF-8 bytes,
+no control characters) starts a concise `Historial.md`. Existing format-1
+histories are not converted by reads, section updates or ordinary saves;
+creation without `summary` retains the legacy behavior.
+
+Format 2 shows dated UTC entries, with one short description per accepted
+change rather than numbered copies of `Memoria.md`. It is not a means of
+restoring past Memory contents. Hidden entry markers correlate the internal
+revision and request; the replaceable `.accepted.json` keeps one exact accepted
+Memory, bound to the log tip. Keep this sidecar with the two Markdown files.
+It does not accumulate copies. It is not a second user-facing Memory or a
+distributed lock. The history file is still published through a safe staged
+rewrite; the logical change is an appended entry, not a full Memory snapshot.
+
+`update_sections` takes a map of canonical H2 titles to replacement section
+contents (headings excluded). It preserves untouched bytes, checks heading
+boundaries and validates the complete successor including its required links.
+A byte-identical successor adds no entry. As for a full-body update, stale
+expected bytes or revision are a conflict, not an implicit merge.
+
+The pending intent for format 2 includes exact before/after accepted-head
+bytes in addition to the Markdown files. Publication verifies all three before
+removing the pending barrier. Inspection includes optional `accepted_head`;
+explicit recovery requires the full unchanged observation. No implicit repair,
+retry, pruning or migration.
+
 ## Publication, conflicts and manual approval
 
 `Store` opens an explicitly selected valid vault. Current lookup is direct by
@@ -383,9 +411,10 @@ No interactive prompts, shell execution, model call or network service.
 | capabilities | `{}` |
 | resolve | `{working_directory, authorized_boundary}` |
 | read | `{memory_id}` |
-| create | `{context:{working_directory,authorized_boundary}, title, sections:[five strings], project?, memory_subfolders?:[relative paths]}` |
+| create | `{context:{working_directory,authorized_boundary}, title, sections:[five strings], project?, memory_subfolders?:[relative paths], summary?}` |
 | replace_missing | `{context, binding_directory, expected_memory_id, expected_marker, human_approved, title, sections:[five strings], project?}` |
 | update | `{memory_id, expected:{revision,accepted_markdown}, body}` |
+| update_sections | `{memory_id, expected:{revision,accepted_markdown}, changes, summary}` |
 | accept_external | `{memory_id, expected:{revision,accepted_markdown}, observed_markdown, approved_markdown, human_approved}` |
 | inspect_recovery | `{memory_id, context?}` |
 | recover | `{memory_id, context?, observation:<exact inspection observation>, human_approved}` |
@@ -402,7 +431,7 @@ normally returns `{status:"found", observation}`: here found means an observatio
 was obtained, **not** that a valid accepted Memory exists. Corrupt history instead
 returns `{status:"partial",reason:"history_corrupt",observation}`. Observation
 contains `memory_id,current,history,pending,marker,reservation` (raw components
-nullable), optional `reassociation`, optional `history_bytes`, and
+nullable), optional `reassociation`, `history_bytes`, `accepted_head`, and
 `history_corrupt` (false by default). Pass the entire unchanged observation back;
 these are additive v1 fields, not authority. It may contain sensitive context;
 do not log it unnecessarily.
@@ -418,9 +447,10 @@ All operation argument objects reject unknown fields.
 | `capabilities` | `{}` |
 | `resolve` | `{working_directory, authorized_boundary}`: existing directory paths |
 | `read` | `{memory_id}` |
-| `create` | `{context:{working_directory,authorized_boundary}, title, sections:[s1,s2,s3,s4,s5], project?, memory_subfolders?}`; section strings contain content only, in canonical order; default subfolders `[]` |
+| `create` | `{context:{working_directory,authorized_boundary}, title, sections:[s1,s2,s3,s4,s5], project?, memory_subfolders?, summary?}`; section strings contain content only, in canonical order; `summary` selects history format 2 |
 | `replace_missing` | `{context:{working_directory,authorized_boundary}, binding_directory, expected_memory_id, expected_marker, human_approved, title, sections:[s1,s2,s3,s4,s5], project?}`; exact approved old marker/identity and actual authorized target; existing child declarations preserved, not supplied again |
 | `update` | `{memory_id, expected:{revision,accepted_markdown}, body}`: complete successor body, not a full document |
+| `update_sections` | `{memory_id, expected:{revision,accepted_markdown}, changes, summary}`: only changed section contents, keyed by canonical H2 |
 | `accept_external` | `{memory_id, expected:{revision,accepted_markdown}, observed_markdown, approved_markdown, human_approved}` |
 | `inspect_recovery` | `{memory_id, context?}`; authorized context is needed to include creation marker/receipt |
 | `recover` | `{memory_id, context?, observation, human_approved}`; pass the complete exact prior observation |

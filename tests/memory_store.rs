@@ -569,3 +569,133 @@ fn unchanged_context_does_not_append_a_revision() {
     assert_eq!(saved.revision, 1);
     assert_eq!(fs::read(path(&vault, id, "Historial.md")).unwrap(), history);
 }
+
+#[test]
+fn change_log_records_only_changes_and_keeps_untouched_sections_exact() {
+    let temp = tempfile::tempdir().unwrap();
+    let vault = vault(temp.path());
+    let ctx = context(temp.path());
+    let store = Store::open(&vault).unwrap();
+    let id = store
+        .create_log(request(40), create(&ctx), "Se inició el proyecto.")
+        .unwrap()
+        .memory_id;
+    let initial = expected(&store, id);
+    let history = path(&vault, id, "Historial.md");
+    let first = fs::read_to_string(&history).unwrap();
+    let changes = [("Outcome status".into(), "Done\n\n".into())].into();
+    let saved = store
+        .update_sections(
+            id,
+            request(41),
+            initial.clone(),
+            &changes,
+            "Se cerró el bloqueo porque llegó la aprobación.",
+        )
+        .unwrap();
+    assert_eq!(saved.revision, 2);
+    let next = expected(&store, id);
+    assert_eq!(
+        next.accepted_markdown,
+        initial
+            .accepted_markdown
+            .replace("memory_revision: 1", "memory_revision: 2")
+            .replace("In progress", "Done")
+    );
+    let second = fs::read_to_string(&history).unwrap();
+    let entry = second.strip_prefix(&first).unwrap();
+    assert!(entry.contains("Se cerró el bloqueo porque llegó la aprobación."));
+    assert_eq!(entry.matches("\n- ").count(), 1);
+    assert!(!second.contains("## Revision") && !second.contains("Synthetic evidence"));
+    assert_eq!(
+        store
+            .update_sections(id, request(42), next.clone(), &changes, "Sin cambios.")
+            .unwrap()
+            .status,
+        "unchanged"
+    );
+    assert_eq!(
+        store
+            .update_sections(id, request(43), initial, &changes, "Base antigua.")
+            .unwrap_err()
+            .status,
+        "conflict"
+    );
+    let injected = [(
+        "Outcome status".into(),
+        "## Relevant evidence\nDuplicado\n".into(),
+    )]
+    .into();
+    assert_eq!(
+        store
+            .update_sections(id, request(44), next, &injected, "Inválido.")
+            .unwrap_err()
+            .status,
+        "invalid"
+    );
+    assert_eq!(fs::read_to_string(history).unwrap(), second);
+}
+
+#[test]
+fn change_log_recovers_exact_intents_and_manual_edits_still_require_approval() {
+    for fault in [
+        Fault::AfterPending,
+        Fault::AfterCurrent,
+        Fault::AfterHistory,
+        Fault::AfterHead,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = vault(temp.path());
+        let ctx = context(temp.path());
+        let store = Store::open(&vault).unwrap();
+        let id = store
+            .create_log(request(60), create(&ctx), "Inicio.")
+            .unwrap()
+            .memory_id;
+        let initial = expected(&store, id);
+        let current = path(&vault, id, "Memoria.md");
+        let draft = initial
+            .accepted_markdown
+            .replace("In progress", "Un cambio humano");
+        fs::write(&current, &draft).unwrap();
+        let review = store.read(id).unwrap();
+        assert_eq!(review.status, "manual_review");
+        assert_eq!(
+            review.accepted_markdown,
+            Some(initial.accepted_markdown.clone())
+        );
+        let candidate = review.approval_candidate.unwrap();
+        assert_eq!(
+            store
+                .accept_external(id, request(61), initial.clone(), &draft, &candidate, false)
+                .unwrap_err()
+                .status,
+            "manual_review"
+        );
+        let fail_after = Store::open(&vault).unwrap().with_fault(fault);
+        assert_eq!(
+            fail_after
+                .accept_external(id, request(62), initial, &draft, &candidate, true)
+                .unwrap_err()
+                .status,
+            "partial"
+        );
+        assert_eq!(store.read(id).unwrap().status, "partial");
+        let observation = store.inspect_recovery(id, None).unwrap();
+        let mut stale = observation.clone();
+        stale.accepted_head = None;
+        assert_eq!(
+            store.recover(id, None, stale, true).unwrap_err().status,
+            "conflict"
+        );
+        assert_eq!(
+            store.recover(id, None, observation, true).unwrap().revision,
+            2
+        );
+        assert_eq!(expected(&store, id).accepted_markdown, candidate);
+        let history = fs::read_to_string(path(&vault, id, "Historial.md")).unwrap();
+        assert!(history.contains("Outcome status"));
+        assert!(!history.contains("Un cambio humano"));
+        assert_eq!(history.matches("\n- ").count(), 2);
+    }
+}
