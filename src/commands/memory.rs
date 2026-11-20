@@ -1,5 +1,6 @@
-use crate::memory::store::{
-    Context, Create, Expected, Failure, Observation, ReplaceMissing, Store,
+use crate::memory::{
+    markdown::SectionEdit,
+    store::{Context, Create, Expected, Failure, Observation, ReplaceMissing, Store},
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -37,13 +38,37 @@ struct Update {
     body: String,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SectionUpdate {
-    memory_id: Uuid,
-    expected: Expected,
-    changes: BTreeMap<String, String>,
-    summary: String,
+#[serde(untagged, deny_unknown_fields)]
+enum SectionUpdate {
+    Changes {
+        memory_id: Uuid,
+        expected: Expected,
+        changes: BTreeMap<String, String>,
+        summary: String,
+        // A protocol precondition for callers that must reject older Brain
+        // binaries; this implementation preserves separators either way.
+        #[serde(
+            default,
+            rename = "require_preserved_separator",
+            deserialize_with = "require_true"
+        )]
+        _require_preserved_separator: bool,
+    },
+    Edits {
+        memory_id: Uuid,
+        expected: Expected,
+        edits: Vec<SectionEdit>,
+        summary: String,
+    },
 }
+fn require_true<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom("precondition must be true"))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Approval {
@@ -152,14 +177,20 @@ fn dispatch(request: Request, max_input: u64, max_output: u64) -> Value {
             args::<Update>(arguments)
                 .and_then(|args| store.update(args.memory_id, id, args.expected, &args.body)),
         ),
-        "update_sections" => value(args::<SectionUpdate>(arguments).and_then(|args| {
-            store.update_sections(
-                args.memory_id,
-                id,
-                args.expected,
-                &args.changes,
-                &args.summary,
-            )
+        "update_sections" => value(args::<SectionUpdate>(arguments).and_then(|args| match args {
+            SectionUpdate::Changes {
+                memory_id,
+                expected,
+                changes,
+                summary,
+                ..
+            } => store.update_sections(memory_id, id, expected, &changes, &summary),
+            SectionUpdate::Edits {
+                memory_id,
+                expected,
+                edits,
+                summary,
+            } => store.update_section_edits(memory_id, id, expected, &edits, &summary),
         })),
         "accept_external" => value(args::<Approval>(arguments).and_then(|args| {
             store.accept_external(

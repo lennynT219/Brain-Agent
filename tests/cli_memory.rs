@@ -57,6 +57,160 @@ fn context(root: &Path) -> Value {
 }
 
 #[test]
+fn section_edits_use_one_exact_baseline_and_publish_one_history_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    init(root);
+    let created = call(
+        root, 150, "create",
+        json!({"context":context(root),"title":"Ediciones","sections":["a","b","c","d","e"],"summary":"Inicio."}),
+    );
+    assert_eq!(created["result"]["status"], "saved");
+    let id: Uuid = serde_json::from_value(created["result"]["memory_id"].clone()).unwrap();
+    let read = || call(root, 151, "read", json!({"memory_id":id}))["result"].clone();
+    let expected = |state: &Value| json!({"revision":state["revision"],"accepted_markdown":state["accepted_markdown"]});
+    let link = brain::memory::history_link(id);
+    let body = format!(
+        "Preámbulo\n\n## Objective and scope\r\nÚltimo ááá; único\r\n\r\n## Current decisions\rDecision\r\r## Outcome status\núnico y BORRAR\n## Relevant evidence\r\n{link}\r\n\r\n## Next actions and open questions"
+    );
+    let seeded = call(root, 152, "update", json!({"memory_id":id,"expected":expected(&read()),"body":body}));
+    assert_eq!(seeded["result"]["status"], "saved");
+    let before = read();
+    let baseline = expected(&before);
+    let dir = root.join("vault/05-memorias").join(id.to_string());
+    let files = || ["Memoria.md", "Historial.md", ".accepted.json"].map(|file| fs::read(dir.join(file)).unwrap());
+    let original = files();
+    let edit = |section: &str, old_text: &str, new_text: &str| {
+        json!({"section":section,"oldText":old_text,"newText":new_text})
+    };
+    let objective = "Objective and scope";
+    let outcome = "Outcome status";
+    let exact = edit(objective, "único\r\n", "único nuevo\r\n");
+    let run_edits = |n, base: &Value, edits: Value| {
+        call(root, n, "update_sections", json!({"memory_id":id,"expected":base,"edits":edits,"summary":"Edición puntual."}))["result"].clone()
+    };
+
+    for (batch, reason) in [
+        (json!([exact, edit(outcome, "ausente", "x")]), Some("EDIT_NOT_FOUND")),
+        (json!([edit(objective, "áá", "x")]), Some("EDIT_AMBIGUOUS")),
+        (json!([exact, edit(objective, "; único", "x")]), Some("EDITS_OVERLAP")),
+        (json!([edit(objective, "scope\r\nÚltimo", "x")]), Some("EDIT_NOT_FOUND")),
+        (json!([edit(objective, "\nÚltimo", "x")]), Some("EDIT_NOT_FOUND")),
+        (json!([edit(objective, "único\r\n\r\n## Current decisions", "x")]), Some("EDIT_NOT_FOUND")),
+        (json!([edit("Next actions and open questions", "\n", "x")]), Some("EDIT_NOT_FOUND")),
+        (json!([edit("Relevant evidence", &link, &format!("`{link}`"))]), None),
+        (json!([edit("Current decisions", "Decision", "\nDecision")]), None),
+        (json!([edit(objective, "Último", "## Extra\r\n")]), None),
+        (json!([edit(objective, "", "x")]), None),
+        (json!([edit("Unknown section", "único", "x")]), None),
+        (json!([{"section":objective,"oldText":"Último","newText":"x","unknown":true}]), None),
+        (json!([]), None),
+        (json!(vec![exact.clone(); 33]), None),
+    ] {
+        let rejected = run_edits(153, &baseline, batch);
+        assert_eq!(rejected["status"], "invalid", "{rejected}");
+        assert_eq!(rejected["reason"].as_str(), reason, "{rejected}");
+        if reason.is_some() {
+            assert_eq!(rejected["message"], "document or arguments failed validation");
+        }
+        assert_eq!(files(), original);
+    }
+    let common = json!({"memory_id":id,"expected":baseline,"summary":"Prueba de esquema."});
+    for fields in [json!({}), json!({"changes":null,"edits":[exact]}), json!({"changes":{(objective):"otro"},"edits":[exact]})] {
+        let mut args = common.clone();
+        args.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        assert_eq!(call(root, 154, "update_sections", args)["result"]["status"], "invalid");
+        assert_eq!(files(), original);
+    }
+    let saved = run_edits(155, &baseline, json!([
+        edit(outcome, " BORRAR", ""),
+        edit(objective, "Último", "único\r\n"),
+        exact,
+    ]));
+    assert_eq!(saved["status"], "saved");
+    assert_eq!(saved["revision"], 3);
+    let after = read();
+    assert_eq!(after["accepted_markdown"].as_str().unwrap(),
+        before["accepted_markdown"].as_str().unwrap()
+            .replace("memory_revision: 2", "memory_revision: 3")
+            .replace("Último ááá; único\r\n", "único\r\n ááá; único nuevo\r\n")
+            .replace("y BORRAR", "y"));
+    let published = files();
+    let entry = published[1].strip_prefix(original[1].as_slice()).unwrap();
+    let entry = std::str::from_utf8(entry).unwrap();
+    assert_eq!(entry.matches("\n- ").count(), 1);
+    assert!(entry.contains("Edición puntual."));
+    assert_eq!(run_edits(156, &baseline, json!([exact]))["status"], "conflict");
+    let wrong_bytes = json!({"revision":3,"accepted_markdown":before["accepted_markdown"]});
+    assert_eq!(run_edits(157, &wrong_bytes, json!([exact]))["status"], "conflict");
+    let no_op = run_edits(158, &expected(&after), json!([edit(outcome, "y", "y")]));
+    assert_eq!(no_op["status"], "unchanged");
+    assert_eq!(no_op["revision"], 3);
+    assert_eq!(files(), published);
+
+    let changed = call(root, 159, "update_sections", json!({"memory_id":id,"expected":expected(&after),"changes":{(outcome):"Cerrado\n"},"summary":"Reemplazo completo."}));
+    assert_eq!(changed["result"]["status"], "saved");
+    assert!(read()["accepted_markdown"].as_str().unwrap().contains("## Outcome status\nCerrado\n"));
+}
+
+#[test]
+fn whole_section_separator_precondition_is_changes_only_and_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    init(root);
+    let created = call(
+        root, 160, "create",
+        json!({"context":context(root),"title":"Separador","sections":["A","B","antes","D","E"],"summary":"Inicio."}),
+    );
+    assert_eq!(created["result"]["status"], "saved");
+    let id: Uuid = serde_json::from_value(created["result"]["memory_id"].clone()).unwrap();
+    let read = || call(root, 161, "read", json!({"memory_id":id}))["result"].clone();
+    let expected = |state: &Value| {
+        json!({"revision":state["revision"],"accepted_markdown":state["accepted_markdown"]})
+    };
+    let initial = read();
+    let dir = root.join("vault/05-memorias").join(id.to_string());
+    let files = || {
+        ["Memoria.md", "Historial.md", ".accepted.json"]
+            .map(|file| fs::read(dir.join(file)).unwrap())
+    };
+    let original = files();
+    let call_update = |n, state: &Value, fields: Value| {
+        let mut args = json!({"memory_id":id,"expected":expected(state),"summary":"Cambia sección."});
+        args.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        call(root, n, "update_sections", args)["result"].clone()
+    };
+    for field in [json!(false), Value::Null, json!("true"), json!(1)] {
+        let rejected = call_update(162, &initial, json!({"changes":{"Outcome status":"después"},"require_preserved_separator":field}));
+        assert_eq!(rejected["status"], "invalid");
+    }
+    let rejected = call_update(163, &initial, json!({"edits":[{"section":"Outcome status","oldText":"antes","newText":"después"}],"require_preserved_separator":true}));
+    assert_eq!(rejected["status"], "invalid");
+    assert_eq!(files(), original);
+
+    let saved = call_update(164, &initial, json!({"changes":{"Outcome status":"después"},"require_preserved_separator":true}));
+    assert_eq!(saved["status"], "saved");
+    let next = read();
+    assert_eq!(next["accepted_markdown"].as_str().unwrap(), initial["accepted_markdown"].as_str().unwrap().replace("memory_revision: 1", "memory_revision: 2").replace("antes\n\n", "después\n\n"));
+    let published = files();
+    let entry = published[1].strip_prefix(original[1].as_slice()).unwrap();
+    assert_eq!(std::str::from_utf8(entry).unwrap().matches("\n- ").count(), 1);
+    assert_eq!(call_update(165, &next, json!({"changes":{"Outcome status":"después"}}))["status"], "unchanged");
+    assert_eq!(files(), published);
+
+    let markdown = next["accepted_markdown"].as_str().unwrap();
+    let doc = brain::memory::markdown::MemoryDocument::parse(id, markdown).unwrap();
+    let mixed = doc.body().replace("## Outcome status\ndespués\n\n", "## Outcome status\rdespués\n\n");
+    let seeded = call(root, 166, "update", json!({"memory_id":id,"expected":expected(&next),"body":mixed}));
+    assert_eq!(seeded["result"]["status"], "saved");
+    let mixed = read();
+    let mixed_files = files();
+    let rejected = call_update(167, &mixed, json!({"changes":{"Outcome status":"","Current decisions":"otro"},"require_preserved_separator":true}));
+    assert_eq!(rejected["status"], "invalid");
+    assert_eq!(files(), mixed_files);
+}
+
+#[test]
 fn unclosed_html_create_has_fixed_reason_without_persisted_identity() {
     for content in [
         "05-memorias/<UUID>/Memoria.md",

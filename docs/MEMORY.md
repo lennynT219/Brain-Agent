@@ -291,11 +291,46 @@ It does not accumulate copies. It is not a second user-facing Memory or a
 distributed lock. The history file is still published through a safe staged
 rewrite; the logical change is an appended entry, not a full Memory snapshot.
 
-`update_sections` takes a map of canonical H2 titles to replacement section
-contents (headings excluded). It preserves untouched bytes, checks heading
-boundaries and validates the complete successor including its required links.
-A byte-identical successor adds no entry. As for a full-body update, stale
-expected bytes or revision are a conflict, not an implicit merge.
+`update_sections` accepts exactly one of `changes` (a map of canonical H2
+names to whole replacement section contents) or `edits` (1–32 objects with
+`section`, `oldText`, `newText`). Both use the same exact `expected` baseline,
+`summary` and save receipt. Example edit:
+`{"section":"Outcome status","oldText":"In progress","newText":"Done"}`.
+
+Each `oldText` must be nonempty and match literally once within the original
+content of the named canonical section. The heading and its line ending do
+not belong to the content. `newText` can be empty to delete the match. There
+is no trimming or newline normalization: supply `\r\n` when the anchor contains
+an actual CRLF. Overlapping occurrences count as multiple matches. Every anchor
+is resolved before any replacement, so request order cannot create or remove
+another edit's match. Missing/out-of-section anchors, ambiguous anchors and
+overlapping edit ranges reject the entire batch with `invalid` and reason
+`EDIT_NOT_FOUND`, `EDIT_AMBIGUOUS` or `EDITS_OVERLAP`, respectively.
+
+Both forms preserve untouched bytes, check the canonical heading boundaries,
+and validate the complete successor including its required active links.
+For `changes`, a replacement in a non-final section that does not end in CR
+or LF keeps the existing separator before the next H2: the last content line's
+terminator and all subsequent blank lines, including their spaces, tabs and
+line endings. Trailing spaces on the old content line are not part of that
+separator. In an empty section, newly added content uses the H2's line ending
+before any retained blank lines; clearing a section retains the blank lines
+but drops the old content line's terminator. An inferred replacement that
+would fuse a lone CR at the H2 with a following LF is `invalid` rather than
+silently dropping a logical line ending. Normal CRLF is supported. An explicit
+ending is used exactly as supplied (e.g. `"Done\n"` gives zero blank lines,
+`"Done\n\n"` gives one). The final section has no inferred suffix.
+
+`changes` optionally accepts the sibling field `require_preserved_separator`.
+If present it must be the JSON literal `true`; it is not valid with `edits`.
+Omitting it does not change behavior on this Brain version. It lets callers
+require the contract without probing: older strict decoders reject the unknown
+field rather than applying a replacement that can lose the separator.
+
+`edits` does not add separators or line breaks. One successful batch advances
+one revision and adds one history entry; a byte-identical successor returns
+`unchanged` without an entry. Stale expected bytes or revision are a `conflict`,
+not an implicit merge. The `capabilities` operations list is unchanged.
 
 The pending intent for format 2 includes exact before/after accepted-head
 bytes in addition to the Markdown files. Publication verifies all three before
@@ -427,7 +462,7 @@ No interactive prompts, shell execution, model call or network service.
 | create | `{context:{working_directory,authorized_boundary}, title, sections:[five strings], project?, memory_subfolders?:[relative paths], summary?}` |
 | replace_missing | `{context, binding_directory, expected_memory_id, expected_marker, human_approved, title, sections:[five strings], project?}` |
 | update | `{memory_id, expected:{revision,accepted_markdown}, body}` |
-| update_sections | `{memory_id, expected:{revision,accepted_markdown}, changes, summary}` |
+| update_sections | `{memory_id, expected:{revision,accepted_markdown}, summary}` plus `changes` (optionally `require_preserved_separator:true`) or `edits`, exclusively |
 | accept_external | `{memory_id, expected:{revision,accepted_markdown}, observed_markdown, approved_markdown, human_approved}` |
 | inspect_recovery | `{memory_id, context?}` |
 | recover | `{memory_id, context?, observation:<exact inspection observation>, human_approved}` |
@@ -463,7 +498,7 @@ All operation argument objects reject unknown fields.
 | `create` | `{context:{working_directory,authorized_boundary}, title, sections:[s1,s2,s3,s4,s5], project?, memory_subfolders?, summary?}`; section strings contain content only, in canonical order; `summary` selects history format 2 |
 | `replace_missing` | `{context:{working_directory,authorized_boundary}, binding_directory, expected_memory_id, expected_marker, human_approved, title, sections:[s1,s2,s3,s4,s5], project?}`; exact approved old marker/identity and actual authorized target; existing child declarations preserved, not supplied again |
 | `update` | `{memory_id, expected:{revision,accepted_markdown}, body}`: complete successor body, not a full document |
-| `update_sections` | `{memory_id, expected:{revision,accepted_markdown}, changes, summary}`: only changed section contents, keyed by canonical H2 |
+| `update_sections` | `{memory_id, expected:{revision,accepted_markdown}, summary}` plus `changes` keyed by canonical H2 (optional `require_preserved_separator:true`), or `edits:[{section, oldText, newText}, …]` (1–32) |
 | `accept_external` | `{memory_id, expected:{revision,accepted_markdown}, observed_markdown, approved_markdown, human_approved}` |
 | `inspect_recovery` | `{memory_id, context?}`; authorized context is needed to include creation marker/receipt |
 | `recover` | `{memory_id, context?, observation, human_approved}`; pass the complete exact prior observation |

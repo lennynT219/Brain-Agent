@@ -1,7 +1,7 @@
 //! Validate owned fields while retaining the original Markdown, not a Serde
 //! round-trip of unknown properties/comments. No include/property resolver.
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::history_link;
@@ -14,6 +14,67 @@ pub struct MemoryDocument {
     pub revision: u64,
     body_start: usize,
     frontmatter_end: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SectionEdit {
+    pub section: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Debug)]
+pub(super) enum EditFailure {
+    NotFound,
+    Ambiguous,
+    Overlap,
+}
+
+impl EditFailure {
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::NotFound => "EDIT_NOT_FOUND",
+            Self::Ambiguous => "EDIT_AMBIGUOUS",
+            Self::Overlap => "EDITS_OVERLAP",
+        }
+    }
+}
+
+impl std::fmt::Display for EditFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+impl std::error::Error for EditFailure {}
+
+fn section_content_start(body: &str, start: usize) -> usize {
+    let section = &body[start..];
+    section.find(['\r', '\n']).map_or(body.len(), |n| {
+        start + n + if section[n..].starts_with("\r\n") { 2 } else { 1 }
+    })
+}
+
+/// Split off the last content line's terminator and any following complete
+/// blank lines. The H2 terminator is not part of `content`.
+fn section_separator(content: &str) -> (&str, &str) {
+    let mut end = content.len();
+    while end != 0 {
+        let line = &content[..end];
+        let Some(text) = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix(['\r', '\n']))
+        else {
+            // A next canonical H2 is at a line start, so this should not occur.
+            return ("", &content[end..]);
+        };
+        let start = text.rfind(['\r', '\n']).map_or(0, |i| i + 1);
+        if !text[start..].bytes().all(|b| matches!(b, b' ' | b'\t')) {
+            return (&content[text.len()..end], &content[end..]);
+        }
+        end = start;
+    }
+    ("", content)
 }
 
 fn frontmatter(input: &str) -> Result<(&str, usize, usize)> {
@@ -114,13 +175,90 @@ impl MemoryDocument {
             result.push_str(heading);
             result.push_str(newline);
             result.push_str(change);
-            if i + 1 < starts.len() && !result.ends_with(['\r', '\n']) {
-                result.push_str(newline);
+            if i + 1 < starts.len() && !change.ends_with(['\r', '\n']) {
+                let (terminator, blanks) =
+                    section_separator(&original[heading.len() + newline.len()..]);
+                // Do not silently fuse an inherited blank line (or a leading
+                // LF in the replacement) with an isolated CR on the H2.
+                let following = if change.is_empty() { blanks } else { change };
+                if newline == "\r" && following.starts_with('\n') {
+                    bail!("section replacement would fuse two line endings");
+                }
+                if !change.is_empty() {
+                    result.push_str(if terminator.is_empty() {
+                        newline
+                    } else {
+                        terminator
+                    });
+                }
+                result.push_str(blanks);
             }
         }
         let (_, actual) = super::syntax::topology(&result)?;
         if actual != expected {
             bail!("section replacement changed the canonical heading boundaries");
+        }
+        Ok(result)
+    }
+
+    /// Resolve literal ranges on one original body; never search replacement text.
+    pub(super) fn with_section_edits(&self, edits: &[SectionEdit]) -> Result<String> {
+        use super::CURRENT_SECTIONS;
+        if !(1..=32).contains(&edits.len()) {
+            bail!("provide 1 to 32 section edits");
+        }
+        let body = self.body();
+        let (_, headings) = super::syntax::topology(body)?;
+        let mut resolved = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let i = CURRENT_SECTIONS
+                .iter()
+                .position(|&name| name == edit.section)
+                .context("unknown canonical section")?;
+            let first_char = edit.old_text.chars().next().context("empty edit anchor")?;
+            let start = section_content_start(body, headings[i]);
+            let end = headings.get(i + 1).copied().unwrap_or(body.len());
+            let content = &body[start..end];
+            let hit = content.find(&edit.old_text).ok_or(EditFailure::NotFound)?;
+            // Advance only one character so overlapping occurrences count too.
+            if content[hit + first_char.len_utf8()..].contains(&edit.old_text) {
+                return Err(EditFailure::Ambiguous.into());
+            }
+            let start = start + hit;
+            resolved.push((start, start + edit.old_text.len(), edit.new_text.as_str()));
+        }
+        resolved.sort_unstable_by_key(|&(start, _, _)| start);
+        if resolved.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(EditFailure::Overlap.into());
+        }
+
+        let mut result = String::with_capacity(body.len());
+        let mut edits = resolved.into_iter().peekable();
+        let mut expected = Vec::with_capacity(headings.len());
+        let mut cursor = 0;
+        for boundary in headings.iter().copied().chain(std::iter::once(body.len())) {
+            while let Some(&(start, end, text)) = edits.peek() {
+                if start >= boundary {
+                    break;
+                }
+                result.push_str(&body[cursor..start]);
+                result.push_str(text);
+                cursor = end;
+                edits.next();
+            }
+            result.push_str(&body[cursor..boundary]);
+            expected.push(result.len());
+            cursor = boundary;
+        }
+        expected.pop(); // EOF is not a heading.
+        let (_, actual) = super::syntax::topology(&result)?;
+        if actual != expected
+            || headings.iter().zip(&actual).any(|(&before, &after)| {
+                section_content_start(body, before) - before
+                    != section_content_start(&result, after) - after
+            })
+        {
+            bail!("section edits changed the canonical heading boundaries");
         }
         Ok(result)
     }
@@ -336,6 +474,102 @@ pub(crate) fn project_metadata(input: &str) -> Result<DocumentMetadata> {
         bail!("relation target is not Project");
     }
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod whole_section_tests {
+    use super::*;
+
+    #[test]
+    fn preserve_the_exact_separator_unless_a_terminator_is_explicit() {
+        let id = Uuid::from_u128(104);
+        let body = |section| {
+            format!(
+                "## Objective and scope\nA\n## Current decisions\nB\n## Outcome status{section}## Relevant evidence\n{}\n## Next actions and open questions\nEOF",
+                history_link(id)
+            )
+        };
+        for (original, change, expected) in [
+            ("\nantes\n\n\n", "después", "\ndespués\n\n\n"),
+            ("\r\nantes  \t\n \t\r\n\t\r", "después", "\r\ndespués\n \t\r\n\t\r"),
+            ("\r\nantes\r", "después  ", "\r\ndespués  \r"),
+            ("\r\nantes\r\n\r\n", "después", "\r\ndespués\r\n\r\n"),
+            ("\r\nantes  \t\n \t\r\n\t\r", "", "\r\n \t\r\n\t\r"),
+            ("\r\nantes\n", "", "\r\n"),
+            ("\r\n \t\n\t\r", "después", "\r\ndespués\r\n \t\n\t\r"),
+            ("\r\n \t\n\t\r", "", "\r\n \t\n\t\r"),
+            ("\r\n", "después", "\r\ndespués\r\n"),
+            ("\nantes\n\n\n", "después\n", "\ndespués\n"),
+            ("\nantes\n\n\n", "después\n\n", "\ndespués\n\n"),
+            ("\nantes\r\n", "después\r", "\ndespués\r"),
+            ("\nantes\r\n\r\n", "después\r\n \t\r\n", "\ndespués\r\n \t\r\n"),
+        ] {
+            let doc = create_document(id, "Contexto", &body(original), None).unwrap();
+            let changes = [("Outcome status".into(), change.into())].into();
+            let next = doc.with_sections(&changes).unwrap();
+            assert_eq!(next, body(expected), "{original:?} + {change:?}");
+            let successor = doc.successor(&next).unwrap();
+            assert_eq!(successor.with_sections(&changes).unwrap(), next);
+        }
+        let doc = create_document(id, "Contexto", &body("\rantes\n\n"), None).unwrap();
+        for change in ["", "\ndespués"] {
+            let changes = [("Outcome status".into(), change.into())].into();
+            assert!(doc.with_sections(&changes).is_err(), "{change:?}");
+        }
+        let eof = [("Next actions and open questions".into(), "fin".into())].into();
+        assert!(doc.with_sections(&eof).unwrap().ends_with("questions\nfin"));
+    }
+}
+
+#[cfg(test)]
+mod section_edit_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_heading_cannot_be_replaced_by_a_lookalike() {
+        let id = Uuid::from_u128(101);
+        let body = format!(
+            "## Objective and scope\n\nObjetivo\n\n## Current decisions\n\n-->\n\n## Outcome status\n\nEstado\n\n## Relevant evidence\n\n{}\n\n## Next actions and open questions\n",
+            history_link(id)
+        );
+        let doc = create_document(id, "Contexto", &body, None).unwrap();
+        let replacement = "## Current decisions\n\n<!--";
+        // Standalone validation succeeds: the comment hides the original H2
+        // and the injected one now occupies its canonical spot in the order.
+        assert!(doc.successor(&body.replace("Objetivo", replacement)).is_ok());
+        let edit = SectionEdit {
+            section: "Objective and scope".into(),
+            old_text: "Objetivo".into(),
+            new_text: replacement.into(),
+        };
+        assert!(doc.with_section_edits(&[edit]).is_err());
+    }
+
+    #[test]
+    fn project_link_must_remain_active_but_need_not_be_unique() {
+        let id = Uuid::from_u128(102);
+        let project = ProjectAssociation {
+            brain_project: Uuid::from_u128(103),
+            path: "01-proyectos/Proyecto/Proyecto.md".into(),
+            label: "Proyecto".into(),
+        };
+        let link = project.link();
+        let edit = SectionEdit {
+            section: "Current decisions".into(),
+            old_text: link.clone(),
+            new_text: format!("`{link}`"),
+        };
+        for other_active_link in [false, true] {
+            let spare = if other_active_link { link.as_str() } else { "" };
+            let body = format!(
+                "## Objective and scope\n\n{spare}\n\n## Current decisions\n\n{link}\n\n## Outcome status\n\nEstado\n\n## Relevant evidence\n\n{}\n\n## Next actions and open questions\n",
+                history_link(id)
+            );
+            let doc = create_document(id, "Contexto", &body, Some(&project)).unwrap();
+            let candidate = doc.with_section_edits(std::slice::from_ref(&edit)).unwrap();
+            assert_eq!(doc.successor(&candidate).is_ok(), other_active_link);
+        }
+    }
 }
 
 #[cfg(test)]

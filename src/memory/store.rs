@@ -6,7 +6,7 @@ use super::{
     change_log::{self, HEAD},
     history::{AcceptedSnapshot, History},
     history_link,
-    markdown::{self, MemoryDocument, ProjectAssociation},
+    markdown::{self, MemoryDocument, ProjectAssociation, SectionEdit},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -59,6 +59,8 @@ fn invalid(error: impl Into<anyhow::Error>) -> Failure {
         .is_some()
     {
         failure.reason = Some("UNCLOSED_HTML".into());
+    } else if let Some(edit) = error.downcast_ref::<markdown::EditFailure>() {
+        failure.reason = Some(edit.reason().into());
     }
     failure
 }
@@ -806,6 +808,24 @@ impl Store {
             request,
             expected,
             |document| document.with_sections(changes).map_err(invalid),
+            summary,
+        )
+    }
+
+    pub fn update_section_edits(
+        &self,
+        id: Uuid,
+        request: Uuid,
+        expected: Expected,
+        edits: &[SectionEdit],
+        summary: &str,
+    ) -> Result<Saved> {
+        change_log::validate_summary(summary).map_err(invalid)?;
+        self.update_body(
+            id,
+            request,
+            expected,
+            |document| document.with_section_edits(edits).map_err(invalid),
             summary,
         )
     }
