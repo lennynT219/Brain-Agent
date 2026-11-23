@@ -1,2 +1,7 @@
-binding_version = 1
+binding_version = 2
 memory_id = "14b01305-8257-4c19-8d1c-0cf1a62aa593"
+
+[principal_project]
+project_id = "a84fa3f2-9cbf-435e-a481-b0247e57dffd"
+project_path = "01-proyectos/brainagent-a84fa3f2-9cbf-435e-a481-b0247e57dffd/BrainAgent.md"
+allow_write = true

@@ -147,7 +147,7 @@ fn preview_has_no_writes_and_confirmed_create_defers_memory_then_inherits_projec
     let resolved = f.call("memory", "resolve", json!({"working_directory":f.cwd,"authorized_boundary":f.cwd}));
     assert_eq!(resolved["binding"]["binding_version"], 1);
     assert_eq!(resolved["binding"]["memory_id"], saved["memory_id"]);
-    assert_eq!(resolved["binding"]["memory_subfolders"], json!([]));
+    assert!(resolved["binding"].get("memory_subfolders").is_none());
     assert_ne!(f.create(&p)["status"], "bound");
     assert_eq!(f.call("projects", "list", json!({}))["projects"].as_array().unwrap().len(), 1);
 }
