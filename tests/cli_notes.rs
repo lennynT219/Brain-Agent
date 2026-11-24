@@ -297,6 +297,71 @@ fn requires_write_permission_and_project_id_and_rejects_stale_bytes() {
 }
 
 #[test]
+fn rename_preserves_exact_other_bytes_and_never_overwrites_destination() {
+    let f = Fixture::new();
+    let source = f.notes.join("Original.md");
+    let baseline = document("note", NOTE, "texto\r\n[[Otro]]\n").replace(
+        "title: Título\n",
+        "# keep this\r\ntitle: Título  \r\nproject_link: \"[[01-proyectos/A/Proyecto]]\"\r\nextra: keep\r\n",
+    );
+    fs::write(&source, &baseline).unwrap();
+    let rename = |expected: &str, title: &str| f.call("rename", json!({
+        "project_id":PROJECT,"note_id":NOTE,"expected_markdown":expected,"title":title
+    }));
+    f.bind(Some(false));
+    assert_eq!(rename(&baseline, "Nuevo")["status"], "denied");
+    f.bind(Some(true));
+    assert_eq!(rename(&baseline, "Título")["status"], "unchanged");
+    assert_eq!(rename("stale", "Nuevo")["status"], "conflict");
+    assert_eq!(rename(&baseline, "../Nuevo")["status"], "invalid");
+    let target = f.notes.join("Nuevo.md");
+    fs::write(&target, "unmanaged").unwrap();
+    assert_eq!(rename(&baseline, "Nuevo")["status"], "conflict");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "unmanaged");
+    assert_eq!(fs::read_to_string(&source).unwrap(), baseline);
+    fs::remove_file(&target).unwrap();
+    let receipt = rename(&baseline, "Nuevo");
+    assert_eq!(receipt, json!({"status":"renamed","project_id":PROJECT,"note_id":NOTE,"title":"Nuevo"}));
+    assert!(!source.exists());
+    let next = baseline.replace("title: Título  \r\n", "title: \"Nuevo\"  \r\n");
+    assert_eq!(fs::read_to_string(&target).unwrap(), next);
+    assert_eq!(f.read(NOTE)["markdown"], next);
+    assert_eq!(rename(&next, "Nuevo")["status"], "unchanged");
+    assert_eq!(f.call("inspect_rename", json!({"project_id":PROJECT}))["status"], "no_intent");
+}
+
+#[test]
+fn retained_rename_intent_fences_operations_without_recovery_writes() {
+    let f = Fixture::new();
+    f.bind(Some(true));
+    let source = f.notes.join("Original.md");
+    let target = f.notes.join("Nuevo.md");
+    let before = fs::read_to_string(&source).unwrap();
+    let after = before.replace("title: Título", "title: Nuevo");
+    File::create(f.notes.join(LOCK)).unwrap();
+    let pending = f.notes.join(".brain-note-rename.json");
+    let intent = json!({"version":1,"project_id":PROJECT,"note_id":NOTE,"source":"Original.md","destination":"Nuevo.md","before":before,"after":after}).to_string();
+    fs::write(&pending, &intent).unwrap();
+    let inspect = || f.call("inspect_rename", json!({"project_id":PROJECT}));
+    let state = inspect();
+    assert_eq!(state["status"], "partial");
+    assert_eq!(state["source_state"], "before");
+    assert_eq!(state["destination_state"], "absent");
+    fs::write(&target, &after).unwrap();
+    assert_eq!(inspect()["destination_state"], "after");
+    assert_eq!(f.read(NOTE)["status"], "partial");
+    assert_eq!(f.call("list", json!({"project_id":PROJECT}))["status"], "partial");
+    assert_eq!(f.create("Otra", "body")["status"], "partial");
+    assert_eq!(f.call("rename", json!({"project_id":PROJECT,"note_id":NOTE,"expected_markdown":before,"title":"Nuevo"}))["status"], "partial");
+    assert_eq!(fs::read_to_string(&source).unwrap(), before);
+    assert_eq!(fs::read_to_string(&target).unwrap(), after);
+    assert_eq!(fs::read_to_string(&pending).unwrap(), intent);
+    fs::remove_file(source).unwrap();
+    assert_eq!(inspect()["source_state"], "absent");
+    assert_eq!(inspect()["destination_state"], "after");
+}
+
+#[test]
 fn named_creation_rejects_invalid_titles_and_collisions_without_replacing_notes() {
     let f = Fixture::new();
     f.bind(Some(true));

@@ -1,7 +1,7 @@
 //! The host owns cwd and Brain's existing vault configuration. This endpoint
 //! resolves exactly one Project directory and never consults Memory bindings.
 use crate::document::{CommonMetadata, DOCUMENT_VERSION, DocumentMetadata};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -12,6 +12,8 @@ use std::{
 use uuid::Uuid;
 
 const LOCK: &str = ".brain-notes.lock";
+const RENAME_INTENT: &str = ".brain-note-rename.json";
+const MAX_INTENT: usize = 12 * MAX_DOCUMENT + 4096;
 const MAX_ENTRIES: usize = 256;
 const MAX_DOCUMENT: usize = 512 * 1024;
 const MAX_TITLE: usize = 256;
@@ -43,7 +45,7 @@ fn valid_title(title: &str) -> bool {
     !title.trim().is_empty() && title.len() <= MAX_TITLE && !title.chars().any(char::is_control)
 }
 
-// Creation only: a legacy note is still addressed by brain_id, even if its
+// Creation and explicit rename only: a legacy note is still addressed by brain_id, even if its
 // preexisting filename or title would not meet the new naming rules.
 fn named_filename(title: &str) -> Result<String> {
     let filename = format!("{title}.md");
@@ -82,6 +84,74 @@ struct Note {
     path: PathBuf,
     markdown: String,
     body_start: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameIntent {
+    version: u32,
+    project_id: Uuid,
+    note_id: Uuid,
+    source: String,
+    destination: String,
+    before: String,
+    after: String,
+}
+
+fn rename_partial() -> Failure {
+    Failure("partial", "Note rename requires inspection; do not retry")
+}
+
+fn absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(unavailable("cannot inspect Note publication path")),
+    }
+}
+
+fn note_filename(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.contains(['/', '\\', ':']) && path.file_name().and_then(|name| name.to_str()) == Some(name)
+        && path.extension().is_some_and(|ext| ext == "md")
+}
+
+fn revised_title(note: &Note, title: &str) -> Result<String> {
+    let invalid = || Failure("invalid", "Note title cannot be replaced without rewriting unrelated YAML");
+    let mut lines = note.markdown[..note.body_start].split_inclusive('\n');
+    let mut offset = 0;
+    let mut range = None;
+    while let Some(line) = lines.next() {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = bare.strip_prefix("title:") {
+            let scalar = value.trim_matches([' ', '\t']);
+            let simple = (scalar == note.metadata.title
+                && !scalar.starts_with(['&', '*', '!', '|', '>', '\'', '"', '[', '{'])
+                && !scalar.contains('#'))
+                || serde_json::from_str::<String>(scalar).is_ok_and(|s| s == note.metadata.title);
+            // A later indented continuation, even past a comment/blank line,
+            // must not become detached from a replaced scalar.
+            let continuation = lines.clone()
+                .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+                .is_some_and(|line| line.starts_with([' ', '\t']));
+            if !simple || continuation || range.is_some() {
+                return Err(invalid());
+            }
+            let start = offset + bare.len() - value.trim_start_matches([' ', '\t']).len();
+            range = Some(start..start + scalar.len());
+        }
+        offset += line.len();
+    }
+    let mut next = note.markdown.clone();
+    let range = range.ok_or_else(invalid)?;
+    let encoded = serde_json::to_string(title).map_err(|_| invalid())?;
+    next.replace_range(range, &encoded);
+    let mut expected = note.metadata.clone();
+    expected.title = title.into();
+    if !matches!(metadata(&next, "note"), Ok(Some((DocumentMetadata::Note(decoded), body))) if decoded == expected && next[body..] == note.markdown[note.body_start..]) {
+        return Err(invalid());
+    }
+    Ok(next)
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -260,6 +330,7 @@ impl Scope {
     }
 
     fn notes(&self, mut visit: impl FnMut(Note)) -> Result<usize> {
+        self.no_rename_intent()?;
         let (files, entries) = direct_markdown(&self.notes)?;
         let mut ids = HashSet::new();
         for path in files {
@@ -284,7 +355,12 @@ impl Scope {
                 body_start,
             });
         }
+        self.no_rename_intent()?;
         Ok(entries)
+    }
+
+    fn no_rename_intent(&self) -> Result<()> {
+        if absent(&self.notes.join(RENAME_INTENT))? { Ok(()) } else { Err(rename_partial()) }
     }
 
     fn find(&self, note_id: Uuid) -> Result<Note> {
@@ -297,7 +373,38 @@ impl Scope {
         found.ok_or(Failure("not_found", "Note not found in authorized Project"))
     }
 
+    // Before the first writer, readers do not create a lock. If a writer
+    // appears mid-read, discard that observation instead of returning it.
+    fn read_consistently(&self, work: impl FnOnce() -> Result<Value>) -> Result<Value> {
+        let lock_path = self.notes.join(LOCK);
+        if absent(&lock_path)? {
+            let result = work();
+            if !absent(&lock_path)? {
+                return Err(Failure("busy", "Notes publication lock appeared during read"));
+            }
+            return result;
+        }
+        let _lock = self.lock_for_read(&lock_path)?;
+        work()
+    }
+
+    fn lock_for_read(&self, path: &Path) -> Result<File> {
+        if !fs::symlink_metadata(path).is_ok_and(|m| is_regular(&m)) {
+            return Err(unavailable("invalid Notes publication lock"));
+        }
+        let lock = File::open(path).map_err(|_| unavailable("cannot open Notes publication lock"))?;
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(lock),
+            Err(fs::TryLockError::WouldBlock) => Err(Failure("busy", "Notes publication lock is held")),
+            Err(fs::TryLockError::Error(_)) => Err(unavailable("cannot lock Notes for reading")),
+        }
+    }
+
     pub(crate) fn list(&self) -> Result<Value> {
+        self.read_consistently(|| self.list_locked())
+    }
+
+    fn list_locked(&self) -> Result<Value> {
         let mut notes = Vec::new();
         self.notes(|note| {
             notes.push(json!({"note_id": note.metadata.brain_id, "title": note.metadata.title}))
@@ -306,6 +413,10 @@ impl Scope {
     }
 
     pub(crate) fn read(&self, note_id: Uuid) -> Result<Value> {
+        self.read_consistently(|| self.read_locked(note_id))
+    }
+
+    fn read_locked(&self, note_id: Uuid) -> Result<Value> {
         let note = self.find(note_id)?;
         Ok(
             json!({"status": "found", "project_id": self.binding.project_id,
@@ -457,20 +568,130 @@ impl Scope {
         Ok(receipt("updated"))
     }
 
+    pub(crate) fn rename(&self, project_id: Uuid, note_id: Uuid, expected: &str, title: &str) -> Result<Value> {
+        let _lock = self.lock_for_write(project_id)?;
+        let note = self.find(note_id)?;
+        if note.markdown != expected {
+            return Err(Failure("conflict", "Note baseline no longer matches"));
+        }
+        let receipt = |status| json!({"status":status,"project_id":project_id,"note_id":note_id,"title":title});
+        if title == note.metadata.title {
+            return Ok(receipt("unchanged"));
+        }
+        let filename = named_filename(title)?;
+        let source = note.path.file_name().and_then(|name| name.to_str())
+            .ok_or_else(|| Failure("invalid", "Note filename is not UTF-8"))?;
+        if !note_filename(source) {
+            return Err(Failure("invalid", "Note source filename cannot be retained safely"));
+        }
+        let destination = self.notes.join(&filename);
+        let same_path = source == filename;
+        let mut collision = false;
+        let folded = title.to_lowercase();
+        let entries = self.notes(|other| {
+            collision |= other.metadata.brain_id != note_id && other.metadata.title.to_lowercase() == folded;
+        })?;
+        if collision || (!same_path && !absent(&destination)?) {
+            return Err(Failure("conflict", "Note title or filename already exists"));
+        }
+        // Two stage files and then a retained intent plus possibly two .md files.
+        if entries + 2 > MAX_ENTRIES {
+            return Err(unavailable("Notes directory has insufficient rename capacity"));
+        }
+        let after = revised_title(&note, title)?;
+        let permissions = fs::symlink_metadata(&note.path)
+            .map_err(|_| unavailable("cannot inspect Note permissions"))?.permissions();
+        let staged = self.stage(&after, Some(permissions))?;
+        let intent = RenameIntent { version: 1, project_id, note_id, source: source.into(), destination: filename, before: note.markdown.clone(), after };
+        let encoded = serde_json::to_string(&intent).map_err(|_| unavailable("cannot encode rename intent"))?;
+        let pending = self.stage_bytes(&encoded, None, MAX_INTENT)?;
+        self.recheck()?;
+        if !matches!(read_regular(&note.path, MAX_DOCUMENT), Ok(current) if current == intent.before)
+            || (!same_path && !absent(&destination)?) {
+            return Err(Failure("conflict", "Note paths changed before publication"));
+        }
+        let intent_path = self.notes.join(RENAME_INTENT);
+        pending.persist_noclobber(&intent_path).map_err(|_| rename_partial())?;
+        let verify = |path: &Path, expected: &str| -> Result<()> {
+            if matches!(read_regular(path, MAX_DOCUMENT), Ok(current) if current == expected) { Ok(()) } else { Err(rename_partial()) }
+        };
+        let verify_intent = || {
+            if matches!(read_regular(&intent_path, MAX_INTENT), Ok(current) if current == encoded) {
+                Ok(())
+            } else {
+                Err(rename_partial())
+            }
+        };
+        verify_intent()?;
+        verify(&note.path, &intent.before)?;
+        if same_path {
+            // Only the exact baseline file itself is replaced, as in update.
+            staged.persist(&destination).map_err(|_| rename_partial())?;
+        } else {
+            staged.persist_noclobber(&destination).map_err(|_| rename_partial())?;
+            verify(&destination, &intent.after)?;
+            verify_intent()?;
+            self.recheck().map_err(|_| rename_partial())?;
+            verify(&note.path, &intent.before)?;
+            fs::remove_file(&note.path).map_err(|_| rename_partial())?;
+            if !absent(&note.path).map_err(|_| rename_partial())? { return Err(rename_partial()); }
+        }
+        verify(&destination, &intent.after)?;
+        verify_intent()?;
+        fs::remove_file(intent_path).map_err(|_| rename_partial())?;
+        Ok(receipt("renamed"))
+    }
+
+    pub(crate) fn inspect_rename(&self, project_id: Uuid) -> Result<Value> {
+        if project_id != self.binding.project_id {
+            return Err(Failure("conflict", "active Project changed"));
+        }
+        let path = self.notes.join(RENAME_INTENT);
+        if absent(&path)? { return Ok(json!({"status":"no_intent","project_id":project_id})); }
+        let _lock = self.lock_for_read(&self.notes.join(LOCK)).map_err(|error| {
+            if error.0 == "busy" { error } else { rename_partial() }
+        })?;
+        self.recheck()?;
+        if absent(&path)? { return Ok(json!({"status":"no_intent","project_id":project_id})); }
+        let bytes = read_regular(&path, MAX_INTENT).map_err(|_| rename_partial())?;
+        let intent: RenameIntent = serde_json::from_str(&bytes).map_err(|_| rename_partial())?;
+        if intent.version != 1 || intent.project_id != project_id || intent.note_id.is_nil()
+            || !note_filename(&intent.source) || !note_filename(&intent.destination) {
+            return Err(rename_partial());
+        }
+        let observed = |name: &str| match absent(&self.notes.join(name)) {
+            Ok(true) => "absent",
+            Ok(false) => match read_regular(&self.notes.join(name), MAX_DOCUMENT) {
+                Ok(now) if now == intent.before => "before",
+                Ok(now) if now == intent.after => "after",
+                Ok(_) => "different",
+                Err(_) => "unavailable",
+            },
+            Err(_) => "unavailable",
+        };
+        Ok(json!({"status":"partial","project_id":project_id,"note_id":intent.note_id,
+            "source":intent.source,"destination":intent.destination,
+            "source_state":observed(&intent.source),"destination_state":observed(&intent.destination)}))
+    }
+
     fn stage(
         &self,
         markdown: &str,
         permissions: Option<fs::Permissions>,
     ) -> Result<tempfile::NamedTempFile> {
-        if markdown.len() > MAX_DOCUMENT {
-            return Err(Failure("invalid", "Note exceeds document byte limit"));
+        self.stage_bytes(markdown, permissions, MAX_DOCUMENT)
+    }
+
+    fn stage_bytes(&self, content: &str, permissions: Option<fs::Permissions>, limit: usize) -> Result<tempfile::NamedTempFile> {
+        if content.len() > limit {
+            return Err(Failure("invalid", "Note publication exceeds byte limit"));
         }
         // Stage within `notas/` so publication remains on the same filesystem.
         // The staging entry is never Markdown and is not exposed by the protocol.
         let mut file = tempfile::NamedTempFile::new_in(&self.notes)
             .map_err(|_| unavailable("cannot stage Note"))?;
         let staged = (|| -> io::Result<()> {
-            file.write_all(markdown.as_bytes())?;
+            file.write_all(content.as_bytes())?;
             if let Some(permissions) = permissions {
                 file.as_file().set_permissions(permissions)?;
             }

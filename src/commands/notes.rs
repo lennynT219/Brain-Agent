@@ -51,6 +51,21 @@ struct UpdateNote {
     body: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameNote {
+    project_id: Uuid,
+    note_id: Uuid,
+    expected_markdown: String,
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectRename {
+    project_id: Uuid,
+}
+
 fn arguments<T: DeserializeOwned>(value: Value) -> Result<T, Failure> {
     serde_json::from_value(value).map_err(|_| Failure("invalid", "invalid operation arguments"))
 }
@@ -101,6 +116,17 @@ fn dispatch(request: Request) -> Result<Value, Failure> {
             notes::validate_id(project_id)?;
             notes::validate_id(note_id)?;
             Scope::load()?.update(project_id, note_id, &expected_markdown, &body)
+        }
+        "rename" => {
+            let RenameNote { project_id, note_id, expected_markdown, title } = arguments(request.arguments)?;
+            notes::validate_id(project_id)?;
+            notes::validate_id(note_id)?;
+            Scope::load()?.rename(project_id, note_id, &expected_markdown, &title)
+        }
+        "inspect_rename" => {
+            let InspectRename { project_id } = arguments(request.arguments)?;
+            notes::validate_id(project_id)?;
+            Scope::load()?.inspect_rename(project_id)
         }
         _ => Err(Failure("unsupported", "unsupported Notes operation")),
     }

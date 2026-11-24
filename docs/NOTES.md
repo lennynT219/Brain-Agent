@@ -66,10 +66,12 @@ rechazan.
 | `read` | `{note_id, project_id?:UUID}` | `status: "found"`, `project_id`, `note_id`, `title`, `markdown`, `body` |
 | `create` | `{project_id, title, body, require_named_link?:true}` | `status: "created"`, `project_id`, `note_id`, `title` |
 | `update` | `{project_id, note_id, expected_markdown, body}` | `status: "updated"` o `"unchanged"`, `project_id`, `note_id`, `title` |
+| `rename` | `{project_id, note_id, expected_markdown, title}` | `status: "renamed"` o `"unchanged"`, `project_id`, `note_id`, `title` |
+| `inspect_rename` | `{project_id}` (principal) | `status: "no_intent"` o `"partial"`; véase recuperación |
 
 - En `list/read`, un `project_id` explícito permite una fuente adicional activa
   validada por identidad dentro de `01-proyectos`; ese scope es siempre de lectura.
-  Sin ID se usa el principal. `create/update` nunca usan scopes adicionales.
+  Sin ID se usa el principal. `create/update/rename` nunca usan scopes adicionales.
 - `list` no incluye rutas ni cuerpos. `read` retorna el documento UTF-8 exacto
   en `markdown` y el cuerpo sin frontmatter en `body`. El host conserva el
   `markdown` exacto de la lectura que sirve de base, sin normalizar saltos de
@@ -101,6 +103,41 @@ rechazan.
   no es una lectura posterior ni una garantía de que otro editor no lo haya
   cambiado desde entonces.
 
+### Renombrado y recuperación
+
+`rename` exige el Project principal con escritura habilitada y una base
+`expected_markdown` exacta. El mismo título exacto devuelve `unchanged` y no
+migra el nombre legado. Un título diferente cambia solo el valor YAML de
+`title` y publica en `<título>.md`. Conserva UUID, `project_link`, frontmatter
+ajeno y cuerpo exactos. No busca ni cambia enlaces entrantes. Para evitar una
+reserialización, admite un `title` de línea única (escalar simple o cadena JSON
+entre comillas); otras formas, incluyendo comentarios al final de esa línea,
+se rechazan si no puede aislarse el valor. Usa las reglas portables de `create` y
+rechaza colisiones de título o destino. Un cambio solo de mayúsculas devuelve
+`conflict` si el sistema considera ambas rutas la misma entrada existente.
+Si el título no coincide pero la ruta ya es exactamente la deseada, se
+reemplaza únicamente el archivo de origen que coincide con la base.
+
+Para publicar un cambio de ruta, Brain retiene `.brain-note-rename.json`
+con las rutas directas y los documentos exactos de antes/después. Publica el
+destino sin sobrescribir, verifica el resultado y solo entonces retira el
+origen que aún coincide con la base. Retira el intento al final, tras verificar
+el destino. Esto no es una transacción de dos archivos para observadores
+externos, versiones antiguas ni ante cortes de energía. No usar esas versiones
+ni editores externos durante el renombrado o la reconciliación.
+
+`list/read` obtienen un lock compartido cuando existe y pueden devolver `busy`
+si hay un escritor. Un intento retenido bloquea las operaciones ordinarias de
+Notes en ese Project, incluidas lecturas adicionales, con `partial`.
+`inspect_rename` no escribe; para un intento válido devuelve `partial` con
+`project_id`, `note_id`, nombres `source` y `destination`, y `source_state` y
+`destination_state`: `before`, `after`, `absent`, `different` o `unavailable`.
+Un intento ilegible o inválido también produce `partial`, sin clasificar rutas.
+Sin intento devuelve `no_intent`; eso no confirma un recibo perdido. No hay
+reparación automática ni comando de recuperación: el operador debe revisar las
+copias exactas retenidas y los archivos, fuera de concurrencia, antes de decidir
+cómo reconciliarlos. No borrar el intento para desbloquear sin esa revisión.
+
 ### Límites y fallos
 
 Entrada y salida: 4 MiB (incluido el salto de línea de respuesta). Cada archivo
@@ -115,7 +152,8 @@ nombres de dispositivo reservados de Windows. No hay truncamiento ni paginación
 Los errores tienen `result: {status, message}` con uno de `invalid`,
 `unsupported`, `unbound`, `unavailable`, `denied`, `not_found`, `conflict`,
 `busy`, `input_limit` u `output_limit`. Una respuesta completa y correlacionada
-con uno de estos errores no publicó una nota. `output_limit` puede ocurrir en
+con uno de estos errores no publicó una nota. `partial` es distinto: una
+publicación de renombrado puede haberse iniciado y requiere inspección. `output_limit` puede ocurrir en
 una lectura (por ejemplo, los escapes JSON expanden el contenido), pero no en
 un recibo de escritura. Una escritura con error aún puede haber inicializado
 el archivo de bloqueo. Si falta el recibo tras enviar una escritura, no coincide
