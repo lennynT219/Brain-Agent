@@ -56,6 +56,7 @@ respuesta completa. Otros estados de fallo: `unavailable`, `not_found`, `denied`
 | `status` | `{}` | `status:found` o `unbound`, `binding:unified|legacy|none`, `principal:Project|null`, `allow_write:boolean`, `expected:Baseline` |
 | `list` | `{}` | `status:listed`, `projects:[Project]` |
 | `read` | `{project_id}` | `status:found`, `project`, `markdown`, `body` |
+| `update_body` | `{expected_project:Project,expected:EditScope,expected_markdown,body,human_approved:true}` | `status:updated\|unchanged`, `project` |
 | `preview_create` | `{title,body}` | `status:preview`, `preview:Preview`, `expected:Baseline`; sin escritura |
 | `draft_context` | `{}` | `status:found`, `memory`, `history`; sin selección arbitraria de Memory |
 | `bind` | `{project_id,expected_project:Project,expected:Baseline,human_approved:true}` | `status:bound`, `project`, `allow_write:true`, `memory`, `created:false`, `notes_created:boolean` |
@@ -164,6 +165,24 @@ administra el frontmatter `brain_type: project`, versión 1, UUID y título.
 Seleccionar una ficha existente no modifica ni reserializa sus bytes.
 Si al vincular una ficha existente falta `notas/`, se crea únicamente esa carpeta
 vacía, dentro de la misma confirmación; una entrada no regular o symlink se rechaza.
+
+### Editar el cuerpo de una ficha existente
+
+`update_body` es una operación separada y solo sirve para el principal activo con
+`allow_write: true` del cwd exacto. El host toma `expected_project` y los bytes
+íntegros de `read` (`expected_markdown`), y toma `EditScope` de la respuesta de
+`status`: `vault_directory`, `marker` y `legacy_marker`, sin `memory`. Después de
+revisar y confirmar el nuevo cuerpo no se vuelve a capturar la base.
+
+Brain compara el ámbito, el Project y los bytes originales antes de preparar la
+escritura y bajo los locks cooperativos de vínculo y Projects. Solo reemplaza el
+cuerpo, preservando título, UUID, ruta y bytes del frontmatter, salvo añadir el
+salto de línea del delimitador si estaba al final de un archivo sin cuerpo. No
+cambia Memory, historial, notas ni marcadores y no crea `notas/`. Valen los mismos
+encabezados y el límite total de 512 KiB. No se garantiza CAS contra editores
+externos ni la conservación de metadatos de filesystem ajenos al documento.
+Brain verifica la lectura posterior antes de devolver `updated`. Ante `partial`
+o recibo incierto, inspeccionar el estado; no reintentar ni restaurar automáticamente.
 
 ## Marcador unificado y legado
 

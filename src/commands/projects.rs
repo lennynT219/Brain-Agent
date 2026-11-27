@@ -1,4 +1,4 @@
-use crate::{memory::store::Failure, projects::{self, Baseline, Preview, Project}};
+use crate::{memory::store::Failure, projects::{self, Baseline, EditScope, Preview, Project}};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
@@ -23,6 +23,9 @@ struct Bind { project_id: Uuid, expected_project: Project, expected: Baseline, h
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Create { preview: Preview, expected: Baseline, human_approved: bool }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateBody { expected_project: Project, expected: EditScope, expected_markdown: String, body: String, human_approved: bool }
 fn failure(status: &str, message: &str) -> Failure {
     Failure { status: status.into(), message: message.into(), memory_id: None, io_kind: None, reason: None }
 }
@@ -35,7 +38,7 @@ fn dispatch(request: Request) -> Result<Value, Failure> {
     let a = request.arguments;
     match request.operation.as_str() {
         "capabilities" => { args::<Empty>(a)?; Ok(json!({"status":"found","protocol_version":1,
-            "operations":["capabilities","status","list","read","preview_create","draft_context","bind","create_and_bind"],
+            "operations":["capabilities","status","list","read","preview_create","draft_context","bind","create_and_bind","update_body"],
             "binding_version":2,"max_input_bytes":MAX_WIRE,"max_output_bytes":MAX_WIRE,
             "history_response_bytes":32768,"history_formats":[1,2],"authority":"trusted_local_host",
             "atomicity":"cooperative_locks; no_multi_file_transaction; uncertain_mutation_must_not_retry"})) },
@@ -49,6 +52,8 @@ fn dispatch(request: Request) -> Result<Value, Failure> {
         "create_and_bind" => { let Create { preview, expected, human_approved } = args(a)?;
             let id = preview.project_id();
             projects::bind(request.request_id, id, Some(preview), None, expected, human_approved) },
+        "update_body" => { let UpdateBody { expected_project, expected, expected_markdown, body, human_approved } = args(a)?;
+            projects::update_body(expected_project, expected, &expected_markdown, &body, human_approved) },
         _ => Err(failure("unsupported", "unsupported Projects operation")),
     }
 }
