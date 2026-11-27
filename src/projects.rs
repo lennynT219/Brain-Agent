@@ -151,6 +151,14 @@ pub(crate) fn notes_principal() -> Result<Option<Principal>> {
     principal_from(marker.as_deref(), optional(&cwd.join(".brain-notes.toml"))?.as_deref()).map(|(p, _)| p)
 }
 
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EditScope {
+    vault_directory: PathBuf,
+    marker: Option<String>,
+    legacy_marker: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Baseline {
@@ -159,11 +167,15 @@ pub(crate) struct Baseline {
     legacy_marker: Option<String>,
     memory: Value,
 }
-fn baseline(cwd: &Path, store: &Store) -> Result<Baseline> {
+fn marker_bytes(cwd: &Path) -> Result<(Option<String>, Option<String>)> {
     let marker = optional(&cwd.join(".brain.toml"))?;
     let unified = marker.as_deref().map(Marker::parse).transpose().map_err(invalid)?
         .is_some_and(|m| m.binding_version == 2);
     let legacy_marker = if unified { None } else { optional(&cwd.join(".brain-notes.toml"))? };
+    Ok((marker, legacy_marker))
+}
+fn baseline(cwd: &Path, store: &Store) -> Result<Baseline> {
+    let (marker, legacy_marker) = marker_bytes(cwd)?;
     principal_from(marker.as_deref(), legacy_marker.as_deref())?;
     let memory = store.resolve(&context(cwd))?;
     Ok(Baseline { vault_directory: store.vault_directory().to_path_buf(), marker, legacy_marker, memory })
@@ -287,6 +299,76 @@ pub(crate) fn read(id: Uuid) -> Result<Value> {
     }
     Ok(json!({"status":"found","project":project,"body":&markdown[start..],"markdown":markdown}))
 }
+/// Change only the body of the exact writable Project already bound to this cwd.
+/// No Memory association, note directory creation or marker publication.
+pub(crate) fn update_body(project: Project, expected: EditScope, expected_markdown: &str, body: &str, approved: bool) -> Result<Value> {
+    if !approved { return Err(fail("denied", "explicit host human confirmation required")); }
+    if expected_markdown.len() > MAX_DOCUMENT || !valid_body(body) || body.trim_start().lines().next() == Some("---") {
+        return Err(invalid("Project body"));
+    }
+    let cwd = cwd()?;
+    let vault_dir = vault()?;
+    let check_scope = || {
+        let (marker, legacy_marker) = marker_bytes(&cwd)?;
+        if vault_dir != expected.vault_directory || vault()? != vault_dir || marker != expected.marker || legacy_marker != expected.legacy_marker {
+            return Err(fail("conflict", "Project edit scope changed"));
+        }
+        let (principal, _) = principal_from(marker.as_deref(), legacy_marker.as_deref())?;
+        let principal = principal.ok_or_else(|| fail("denied", "Project editing requires a writable principal"))?;
+        if !principal.allow_write || principal.project_id != project.project_id || principal.project_path != project.path {
+            return Err(fail("denied", "Project editing requires the exact writable principal"));
+        }
+        Ok(())
+    };
+    let check = || {
+        check_scope()?;
+        let actual = find(&vault_dir, project.project_id).map_err(|e| if e.status == "not_found" {
+            fail("conflict", "confirmed Project is no longer active")
+        } else { e })?;
+        if actual != project || regular(&vault_dir.join(&actual.path), MAX_DOCUMENT)? != expected_markdown {
+            return Err(fail("conflict", "confirmed Project document changed"));
+        }
+        Ok(())
+    };
+    check()?;
+    let _binding_lock = binding_lock(&cwd)?;
+    let _project_lock = acquire_lock(&vault_dir.join("01-proyectos").join(PROJECT_LOCK))?;
+    check()?;
+    let (_, start) = crate::notes::metadata(expected_markdown, "project").map_err(convert)?.ok_or_else(|| invalid("Project"))?;
+    let receipt = |status| json!({"status":status,"project":project});
+    if &expected_markdown[start..] == body { return Ok(receipt("unchanged")); }
+    let mut markdown = expected_markdown[..start].to_owned();
+    // A legacy empty file may end at the closing delimiter. Keep its existing bytes.
+    if !markdown.ends_with('\n') { markdown.push_str(if markdown.starts_with("---\r\n") { "\r\n" } else { "\n" }); }
+    markdown.push_str(body);
+    if markdown.len() > MAX_DOCUMENT { return Err(fail("invalid", "Project exceeds document bound")); }
+    let file = vault_dir.join(&project.path);
+    let parent = file.parent().expect("validated Project path");
+    let permissions = fs::symlink_metadata(&file).map_err(io_failure)?.permissions();
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(io_failure)?;
+    staged.write_all(markdown.as_bytes()).map_err(io_failure)?;
+    staged.as_file().set_permissions(permissions).map_err(io_failure)?;
+    staged.as_file().sync_all().map_err(io_failure)?;
+    // Do not enumerate the Project folder with our temporary file present.
+    check_scope()?;
+    directory(&vault_dir.join("01-proyectos"))?;
+    directory(parent)?;
+    if !matches!(regular(&file, MAX_DOCUMENT), Ok(current) if current == expected_markdown) {
+        return Err(fail("conflict", "Project changed while staging"));
+    }
+    // Same-filesystem file replacement, serialized against cooperating Brain writers.
+    if let Err(e) = staged.persist(&file) {
+        if matches!(regular(&file, MAX_DOCUMENT), Ok(current) if current == expected_markdown) {
+            return Err(io_failure(e));
+        }
+        return Err(fail("partial", "Project replacement outcome is uncertain; inspect without retrying"));
+    }
+    if check_scope().is_err() || !matches!(regular(&file, MAX_DOCUMENT), Ok(current) if current == markdown) {
+        return Err(fail("partial", "Project replacement could not be verified; inspect without retrying"));
+    }
+    Ok(receipt("updated"))
+}
+
 pub(crate) fn preview_create(title: String, body: String) -> Result<Value> {
     let project_id = Uuid::new_v4();
     let path = Preview::path(project_id, &title);
